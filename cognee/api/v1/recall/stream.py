@@ -17,6 +17,7 @@ Key invariants (see the v4 design doc):
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, AsyncIterator, Callable, Optional
 
@@ -38,10 +39,34 @@ from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
 
-# Keepalive period in seconds. ``<= 0`` disables keepalives (Task 7 overrides from config).
+# Keepalive period in seconds. ``<= 0`` disables keepalives.
 DEFAULT_KEEPALIVE_INTERVAL = 10.0
 
+# Env var overriding the keepalive period; ``<= 0`` disables keepalives entirely.
+KEEPALIVE_INTERVAL_ENV = "COGNEE_RECALL_KEEPALIVE_INTERVAL"
+
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
+
+
+def resolve_keepalive_interval() -> float:
+    """Read the keepalive period from the environment, falling back to the default.
+
+    A non-numeric value is ignored (logged) so a typo never breaks streaming; a value ``<= 0``
+    is honored and disables keepalives.
+    """
+    raw = os.getenv(KEEPALIVE_INTERVAL_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_KEEPALIVE_INTERVAL
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to %s",
+            KEEPALIVE_INTERVAL_ENV,
+            raw,
+            DEFAULT_KEEPALIVE_INTERVAL,
+        )
+        return DEFAULT_KEEPALIVE_INTERVAL
 
 
 def _line(event: dict) -> str:
@@ -93,16 +118,19 @@ async def _drain(queue: "asyncio.Queue[Any]") -> None:
 async def stream_recall_ndjson(
     *,
     recall_kwargs: dict,
-    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
+    keepalive_interval: Optional[float] = None,
     queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
     recall_fn: Optional[Callable[..., Any]] = None,
 ) -> AsyncIterator[str]:
     """Yield NDJSON lines for a recall.
 
-    ``recall_fn`` defaults to the real ``cognee.recall`` (imported lazily to avoid an import
-    cycle); tests inject a fake that emits stage events. ``recall_kwargs`` are forwarded to it
-    verbatim.
+    ``keepalive_interval`` defaults to :func:`resolve_keepalive_interval` (env-driven) when not
+    given; pass an explicit value to override. ``recall_fn`` defaults to the real
+    ``cognee.recall`` (imported lazily to avoid an import cycle); tests inject a fake that emits
+    stage events. ``recall_kwargs`` are forwarded to it verbatim.
     """
+    if keepalive_interval is None:
+        keepalive_interval = resolve_keepalive_interval()
     if recall_fn is None:
         from cognee.api.v1.recall import recall as recall_fn  # lazy: breaks import cycle
 

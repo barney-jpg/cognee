@@ -10,12 +10,12 @@
 | # | Task | Status | Commit |
 |---|------|--------|--------|
 | 1 | ProgressEmitter module + unit tests | done | 2cc2455f2 |
-| 2 | Streaming orchestrator stream.py | done | (this commit) |
-| 3 | Terminal error mapper + status_code | done | (this commit) |
+| 2 | Streaming orchestrator stream.py | done | 81c402dcd |
+| 3 | Terminal error mapper + status_code | done | 81c402dcd |
 | 4 | Content negotiation router | pending | — |
 | 5 | Emit points recall.py | pending | — |
 | 6 | Emit points get_retriever_output.py | pending | — |
-| 7 | Config keepalive interval | pending | — |
+| 7 | Config keepalive interval | done | (this commit) |
 | 8 | MCP client NDJSON consumption | pending | — |
 | 9 | Integration test e2e | pending | — |
 
