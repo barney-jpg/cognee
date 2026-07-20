@@ -9,9 +9,9 @@
 
 | # | Task | Status | Commit |
 |---|------|--------|--------|
-| 1 | ProgressEmitter module + unit tests | done | (this commit) |
-| 2 | Streaming orchestrator stream.py | pending | — |
-| 3 | Terminal error mapper + status_code | pending | — |
+| 1 | ProgressEmitter module + unit tests | done | 2cc2455f2 |
+| 2 | Streaming orchestrator stream.py | done | (this commit) |
+| 3 | Terminal error mapper + status_code | done | (this commit) |
 | 4 | Content negotiation router | pending | — |
 | 5 | Emit points recall.py | pending | — |
 | 6 | Emit points get_retriever_output.py | pending | — |
