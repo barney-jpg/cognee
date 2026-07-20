@@ -76,6 +76,90 @@ logger = get_logger()
 
 cognee_client: Optional[CogneeClient] = None
 
+
+# ---------------------------------------------------------------------------
+# Progress notifications (issue #1)
+# ---------------------------------------------------------------------------
+# Long recall/search calls carry no data while running, tripping client MCP request
+# timeouts and idle-based reverse-proxy timeouts. A background heartbeat emits
+# `notifications/progress` at a configured interval so the stream stays active and clients
+# that render progress get a "still working" signal — without changing the synchronous
+# return contract. A blind tick for now; once the recall API streams real stages (companion
+# NDJSON work), this can relay actual stages instead.
+
+DEFAULT_PROGRESS_INTERVAL = 5.0
+
+
+def _progress_interval() -> float:
+    """Heartbeat period in seconds from COGNEE_MCP_PROGRESS_INTERVAL (default 5; <=0 disables)."""
+    raw = os.getenv("COGNEE_MCP_PROGRESS_INTERVAL")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_PROGRESS_INTERVAL
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid COGNEE_MCP_PROGRESS_INTERVAL=%r; falling back to %s",
+            raw,
+            DEFAULT_PROGRESS_INTERVAL,
+        )
+        return DEFAULT_PROGRESS_INTERVAL
+
+
+def _progress_target():
+    """Return (session, progress_token) when the client requested progress, else (None, None).
+
+    Per the MCP spec the server may only send progress when the request carried a
+    ``progressToken`` in ``_meta``; without one, tools run unchanged.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        ctx = request_ctx.get()
+    except (ImportError, LookupError):
+        return None, None
+    meta = getattr(ctx, "meta", None)
+    token = getattr(meta, "progressToken", None) if meta is not None else None
+    if token is None:
+        return None, None
+    return getattr(ctx, "session", None), token
+
+
+async def _with_progress(coro, *, label: str):
+    """Await ``coro`` while emitting periodic progress notifications.
+
+    Runs ``coro`` unchanged when progress is disabled or no ``progressToken`` is present. A
+    notification failure is logged and never breaks or delays the tool result; the heartbeat is
+    always cancelled once the result arrives.
+    """
+    interval = _progress_interval()
+    session, token = _progress_target()
+    if interval <= 0 or session is None or token is None:
+        return await coro
+
+    async def _beat():
+        n = 0
+        while True:
+            await asyncio.sleep(interval)
+            n += 1
+            try:
+                await session.send_progress_notification(
+                    progress_token=token, progress=n, message=f"{label}…"
+                )
+            except Exception as exc:  # noqa: BLE001 — progress is best-effort, never fatal
+                logger.warning("Progress notification failed: %s", exc)
+
+    heartbeat = asyncio.create_task(_beat())
+    try:
+        return await coro
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+
+
 # Per-dataset error ring buffer (bounded so long-running servers don't accumulate
 # unbounded memory). Each entry is (iso_timestamp, error_message).
 _TASK_ERROR_HISTORY = 50
@@ -667,11 +751,14 @@ async def search(
     # Parse comma-separated datasets into list
     datasets_list = parse_csv_list(datasets)
     try:
-        search_results = await search_task(
-            search_query,
-            normalized_search_type,
-            normalized_top_k,
-            datasets_list,
+        search_results = await _with_progress(
+            search_task(
+                search_query,
+                normalized_search_type,
+                normalized_top_k,
+                datasets_list,
+            ),
+            label="Searching memory",
         )
     except Exception as e:
         error_msg = f"Search failed: {str(e)}"
@@ -1163,12 +1250,15 @@ async def recall(
         try:
             normalized_top_k = validate_top_k(top_k)
             dataset_list = parse_csv_list(datasets)
-            results = await cognee_client.recall(
-                query_text=query,
-                search_type=search_type,
-                datasets=dataset_list,
-                session_id=session_id,
-                top_k=normalized_top_k,
+            results = await _with_progress(
+                cognee_client.recall(
+                    query_text=query,
+                    search_type=search_type,
+                    datasets=dataset_list,
+                    session_id=session_id,
+                    top_k=normalized_top_k,
+                ),
+                label="Recalling memory",
             )
             return [
                 types.TextContent(

@@ -518,6 +518,23 @@ COGNEE_MCP_AGENT_SCOPED=false
 
 When disabled, the workspace UI header shows `(agent scoping off)` and no per-client datasets are autocreated.
 
+### Progress notifications (long recall/search)
+
+`recall` and `search` run synchronously — the tool call blocks until the full pipeline
+(graph retrieval + LLM generation) finishes. Long calls can exceed a client's per-request MCP
+timeout (e.g. LibreChat's default 60s) or an idle reverse-proxy timeout, tearing the call down
+even though the server is still working.
+
+To keep the stream active, the server emits periodic MCP `notifications/progress` while a
+`recall`/`search` runs — but only when the client includes a `progressToken` in the request
+(per the MCP spec); otherwise the tools behave exactly as before. A notification failure never
+breaks or delays the result. Configure the heartbeat period in `.env`:
+
+```bash
+# Progress heartbeat interval in seconds (default 5). Set to 0 to disable.
+COGNEE_MCP_PROGRESS_INTERVAL=5
+```
+
 ### Per-dataset isolation (`ENABLE_BACKEND_ACCESS_CONTROL`)
 
 Agent scoping decides which dataset *name* a tool defaults to. Whether two datasets are actually isolated at the storage layer is governed by cognee's `ENABLE_BACKEND_ACCESS_CONTROL` flag:
