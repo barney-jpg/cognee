@@ -3,11 +3,11 @@
 **Date:** 2026-07-20
 **Tracking issue:** pajoma/cognee#2 (companion: pajoma/cognee#1 — MCP progress relay)
 **Branch:** `feature/recall-ndjson-streaming`
-**Revision:** v3 — incorporates second review DENY: sentinel is authoritative for termination
-(no completion race), keepalive interval `0` uses an untimed `get()` (no spin), streaming
-error mapper preserves each exception's effective `status_code` (no 404→422 collapse), a
-single output-boundary sequencer owns `seq`, and the cancellation `finally` observes/logs but
-never re-raises. (v2 added: cancellation contract, backpressure, error-stage attribution,
+**Revision:** v4 — third review DENY: cleanup **concurrently drains the queue** while awaiting
+the cancelled task, so a producer blocked on `await queue.put(...)` (including the wrapper's
+sentinel put) under a full bounded queue cannot deadlock on disconnect. (v3: authoritative
+sentinel, untimed `get()` at interval `0`, `status_code` preservation, single-sequencer `seq`,
+non-re-raising cleanup. v2: cancellation contract, backpressure, error-stage attribution,
 Accept parsing, remote-path caveat, started/terminal invariant.)
 
 ## Problem
@@ -108,10 +108,17 @@ sentinel alone is authoritative; the loop never re-reads the queue after seeing 
      then return.
 4. **Cancellation / cleanup (`finally`):** on generator close/GC (client disconnect,
    `StreamingResponse` cancellation) or any exit, if `recall_task` is still running `cancel()`
-   and `await` it; **any non-`CancelledError` exception is observed and logged, then
-   suppressed** — nothing is re-raised from `finally`, so no exception escapes the generator
-   (consistent with the terminal-`error` contract). Then reset the `progress_scope`. This
-   ensures an aborted client leaves no orphaned DB/LLM work and no unretrieved task exception.
+   it, then **await it while concurrently draining the queue**. Draining is essential under
+   backpressure: producers (and the wrapper's `finally: await queue.put(SENTINEL)`) block on a
+   full bounded queue when the consumer stops reading; cancelling the task unwinds it into that
+   same blocking `put`, so without a drainer `await recall_task` would wait on a task that is
+   itself waiting for queue capacity that never frees — a deadlock. Concretely: start a small
+   drainer (`while True: await queue.get()` discarding items) alongside `await recall_task`;
+   once the task completes, cancel the drainer. **Any non-`CancelledError` task exception is
+   observed and logged, then suppressed** — nothing is re-raised from `finally`, so no exception
+   escapes the generator (consistent with the terminal-`error` contract). Then reset the
+   `progress_scope`. This guarantees bounded-time termination with no orphaned DB/LLM work, no
+   unretrieved task exception, and no deadlock even when the queue is full at disconnect.
 
 Starlette cancels the response iterator on disconnect, which propagates into this generator;
 because the recall work runs in a **separate** task, the `finally` block is what actually stops
@@ -297,6 +304,10 @@ permission-denied case) returns normally.
   - **Cancellation:** simulated client disconnect cancels + awaits the recall task (assert it
     terminates) and resets the progress scope; a non-cancellation task exception is logged and
     suppressed, and no exception escapes the generator.
+  - **Saturation + disconnect (deadlock guard):** fill the bounded queue to capacity, then
+    cancel the response iterator — assert termination in bounded time (cleanup drains the queue
+    so the producer's blocked `put`/sentinel unblocks) and the progress scope resets. This is
+    the combined case the separate saturation and cancellation tests do not prove.
   - **`seq` monotonicity:** across a run mixing `progress`, `keepalive`, and the terminal event,
     `seq` is strictly increasing and gap-free.
   - **Status-code preservation:** a `DatasetNotFoundError` (validation subclass, 404) yields a
@@ -328,6 +339,9 @@ permission-denied case) returns normally.
   test.
 - **Status-code drift between representations** → mapper uses `getattr(e, "status_code", 422)`
   exactly like the JSON branch; non-422 subclass test (404).
+- **Deadlock on disconnect with a full queue** → cleanup drains the queue concurrently while
+  awaiting the cancelled task, so a producer/sentinel blocked on `await put()` unblocks; combined
+  saturation+disconnect test proves bounded-time termination.
 - **Orphaned recall work on client disconnect** → `finally` cancels + awaits the recall task and
   observes/logs (then suppresses) its exception; covered by the cancellation test.
 - **Backpressure / lost progress under fan-out** → awaited bounded `put` (producers block, never
