@@ -17,7 +17,7 @@
 | 6 | Emit points get_retriever_output.py | done | ea7755479 |
 | 7 | Config keepalive interval | done | f95ef0df3 |
 | 8 | MCP client NDJSON consumption | done | 4565425f7 |
-| 9 | Integration test e2e | done | (this commit) |
+| 9 | Integration test e2e | done | 6484fe7fa |
 
 ## Log
 - 2026-07-20: rebuilt plan + ledger from committed spec on Linux box (uv 3.12 venv). Starting Task 1.
