@@ -12,9 +12,9 @@
 | 1 | ProgressEmitter module + unit tests | done | 2cc2455f2 |
 | 2 | Streaming orchestrator stream.py | done | 81c402dcd |
 | 3 | Terminal error mapper + status_code | done | 81c402dcd |
-| 4 | Content negotiation router | done | (this commit) |
-| 5 | Emit points recall.py | pending | — |
-| 6 | Emit points get_retriever_output.py | pending | — |
+| 4 | Content negotiation router | done | ca83f6896 |
+| 5 | Emit points recall.py | done | (this commit) |
+| 6 | Emit points get_retriever_output.py | done | (this commit) |
 | 7 | Config keepalive interval | done | f95ef0df3 |
 | 8 | MCP client NDJSON consumption | pending | — |
 | 9 | Integration test e2e | pending | — |
