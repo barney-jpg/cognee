@@ -13,10 +13,10 @@
 | 2 | Streaming orchestrator stream.py | done | 81c402dcd |
 | 3 | Terminal error mapper + status_code | done | 81c402dcd |
 | 4 | Content negotiation router | done | ca83f6896 |
-| 5 | Emit points recall.py | done | (this commit) |
-| 6 | Emit points get_retriever_output.py | done | (this commit) |
+| 5 | Emit points recall.py | done | ea7755479 |
+| 6 | Emit points get_retriever_output.py | done | ea7755479 |
 | 7 | Config keepalive interval | done | f95ef0df3 |
-| 8 | MCP client NDJSON consumption | pending | — |
+| 8 | MCP client NDJSON consumption | done | (this commit) |
 | 9 | Integration test e2e | pending | — |
 
 ## Log

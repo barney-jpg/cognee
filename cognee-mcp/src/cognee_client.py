@@ -27,6 +27,24 @@ except ImportError:
 
 logger = get_logger()
 
+NDJSON_MEDIA_TYPE = "application/x-ndjson"
+
+
+class RecallError(Exception):
+    """A recall terminal-`error` event mapped to an exception.
+
+    Carries ``status_code`` (and optional ``stage``) so callers can distinguish a mapped
+    402/404/422 failure from a generic 409.
+    """
+
+    def __init__(
+        self, message: str, status_code: Optional[int] = None, stage: Optional[str] = None
+    ):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.stage = stage
+
 
 class CogneeClient:
     """
@@ -547,9 +565,38 @@ class CogneeClient:
                 payload["datasets"] = datasets
             if session_id:
                 payload["session_id"] = session_id
-            response = await self.client.post(endpoint, json=payload, headers=self._get_headers())
-            response.raise_for_status()
-            return response.json()
+
+            headers = self._get_headers()
+            headers["Accept"] = NDJSON_MEDIA_TYPE
+            async with self.client.stream(
+                "POST", endpoint, json=payload, headers=headers
+            ) as response:
+                content_type = response.headers.get("content-type", "")
+                if NDJSON_MEDIA_TYPE not in content_type:
+                    # Back-compat: an older backend ignored Accept and returned a JSON body.
+                    await response.aread()
+                    response.raise_for_status()
+                    return response.json()
+
+                # Streaming path: 200 already sent, so failures arrive as a terminal error
+                # event. Ignore progress/keepalive; return the result data (issue #2).
+                result_data: Any = None
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    event_type = event.get("type")
+                    if event_type == "result":
+                        result_data = event.get("data")
+                    elif event_type == "error":
+                        raise RecallError(
+                            event.get("message", "An error occurred during recall."),
+                            status_code=event.get("status_code"),
+                            stage=event.get("stage"),
+                        )
+                    # progress / keepalive events are ignored for issue #2.
+                return result_data
         else:
             with redirect_stdout(sys.stderr):
                 kwargs = {"top_k": top_k, "auto_route": True}
