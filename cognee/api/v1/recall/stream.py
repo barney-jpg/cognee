@@ -69,6 +69,34 @@ def resolve_keepalive_interval() -> float:
         return DEFAULT_KEEPALIVE_INTERVAL
 
 
+def accept_prefers_ndjson(accept: Optional[str]) -> bool:
+    """Return True iff the ``Accept`` header explicitly requests NDJSON with effective ``q > 0``.
+
+    Parses media ranges and ``q`` values rather than substring-matching. Only the exact
+    ``application/x-ndjson`` token selects streaming — ``*/*`` and ``application/json`` fall
+    through to the default JSON representation, so the synchronous path is unchanged unless a
+    client opts in.
+    """
+    if not accept:
+        return False
+    for part in accept.split(","):
+        tokens = part.split(";")
+        media = tokens[0].strip().lower()
+        if media != NDJSON_MEDIA_TYPE:
+            continue
+        q = 1.0
+        for param in tokens[1:]:
+            param = param.strip().lower()
+            if param.startswith("q="):
+                try:
+                    q = float(param[2:])
+                except ValueError:
+                    q = 0.0
+        if q > 0:
+            return True
+    return False
+
+
 def _line(event: dict) -> str:
     """Serialize one event as a single NDJSON line."""
     return json.dumps(event, separators=(",", ":")) + "\n"
@@ -132,7 +160,11 @@ async def stream_recall_ndjson(
     if keepalive_interval is None:
         keepalive_interval = resolve_keepalive_interval()
     if recall_fn is None:
-        from cognee.api.v1.recall import recall as recall_fn  # lazy: breaks import cycle
+        # Lazy attribute access (not a from-import) breaks the import cycle and stays patchable:
+        # `from pkg import recall` re-runs _handle_fromlist and would reset a test's monkeypatch.
+        import cognee.api.v1.recall as _recall_pkg
+
+        recall_fn = _recall_pkg.recall
 
     start = time.monotonic()
     seq = 0
