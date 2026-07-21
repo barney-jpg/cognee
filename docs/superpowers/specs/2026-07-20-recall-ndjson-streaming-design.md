@@ -1,0 +1,358 @@
+# Recall NDJSON Streaming — Design
+
+**Date:** 2026-07-20
+**Tracking issue:** pajoma/cognee#2 (companion: pajoma/cognee#1 — MCP progress relay)
+**Branch:** `feature/recall-ndjson-streaming`
+**Revision:** v4 — third review DENY: cleanup **concurrently drains the queue** while awaiting
+the cancelled task, so a producer blocked on `await queue.put(...)` (including the wrapper's
+sentinel put) under a full bounded queue cannot deadlock on disconnect. (v3: authoritative
+sentinel, untimed `get()` at interval `0`, `status_code` preservation, single-sequencer `seq`,
+non-re-raising cleanup. v2: cancellation contract, backpressure, error-stage attribution,
+Accept parsing, remote-path caveat, started/terminal invariant.)
+
+## Problem
+
+`POST /api/v1/recall` returns a single blocking JSON body: the caller receives nothing
+until the whole pipeline (session/graph retrieval + LLM generation) finishes. Long recalls
+can run many seconds with no data on the wire, which trips downstream MCP/client/proxy idle
+timeouts (the originating symptom: LibreChat's MCP request timeout aborting a recall that
+was still running server-side). There is also no progress signal for UX or observability.
+
+## Goal
+
+Stream recall as **NDJSON** (newline-delimited JSON), selected via **content negotiation**
+on the existing endpoint (no new route), delivering two things:
+
+1. **Liveness (safety net):** a time-based keepalive so the stream never idles longer than a
+   configured interval, guaranteeing recall cannot trip an idle timeout — regardless of how
+   long any single stage (e.g. `llm_generation`) runs silently.
+2. **Semantic stage events (richness):** per-stage `progress` events covering the full local
+   pipeline, including the `graph_retrieval` vs `llm_generation` split.
+
+The synchronous JSON response path must remain **byte-for-byte unchanged** when no streaming
+`Accept` header is present.
+
+## Scope
+
+- **In scope:** the cognee FastAPI streaming side (content negotiation, event production,
+  keepalive, cancellation, error framing) AND the `cognee-mcp` `CogneeClient.recall` consuming
+  the NDJSON stream, collapsing it to the final result (progress/keepalive events ignored for
+  now).
+- **Out of scope (issue #1):** relaying the stage events to LibreChat as MCP
+  `notifications/progress`. Issue #2 is the data source and the client plumbing; #1 turns the
+  ignored events into user-visible progress. The user-facing LibreChat liveness benefit lands
+  with #1.
+- **Non-goals:** no new route; no change to search *types* or routing *decisions* (only
+  reporting them); the existing JSON recall response is not removed or altered.
+
+## Approach (selected: A — contextvar-bound emitter + queue bridge)
+
+The graph sub-stages fire inside `get_retriever_output`, four calls below `recall()`, and
+`authorized_search` is awaited as an opaque unit. A `ProgressEmitter` bound to a
+`contextvar` lets deep code report without threading a callback through every signature; an
+`asyncio.Queue` bridges the (async) `emit()` calls to the top-level async generator that
+produces NDJSON lines. When no emitter is in context (the normal JSON path), `emit()` is a
+cheap no-op, so the synchronous path is behaviorally identical.
+
+Rejected alternatives:
+- **B — explicit `on_stage` callback threaded through the chain:** touches 4 signatures and
+  every caller; more churn and positional-arg risk for the same result.
+- **C — full async-generator refactor of the search chain:** deeply invasive to a hot path
+  shared with `/search`; disproportionate regression risk.
+
+## Architecture & components
+
+### New module: `cognee/modules/recall/progress.py`
+
+- `ProgressEmitter` — wraps a **bounded** `asyncio.Queue`.
+  - `async emit(stage, status, detail=None)` — builds an event dict (**without** `seq`) and
+    does `await queue.put(...)`. The `await put` provides **real backpressure**: if the
+    consumer (drain loop) is slower than producers, producers suspend rather than dropping
+    semantic events. Progress and terminal events are therefore **never lost**.
+  - `seq` is **not** assigned here. It is stamped at the single output boundary (the drain
+    loop) so there is one monotonic sequence across `progress`, `keepalive`, and terminal
+    events — keepalives are generated outside the queue, so any per-producer counter would
+    collide/reorder. The drain loop is the sole writer and the sole sequencer.
+  - `emit` is `async` so it composes with the async producers (`recall`, `get_retriever_output`)
+    and never blocks the event loop.
+- `_progress_emitter: ContextVar[ProgressEmitter | None]` with `get_progress_emitter()` and an
+  async `progress_scope()` context manager that sets/resets it.
+- Module-level `async emit(stage, status, detail=None)` — resolves the contextvar; **no-op
+  when unset** (returns immediately). This is what deep code awaits, so callers never handle
+  the emitter object directly.
+- **Keepalives are NOT enqueued by producers.** They are generated by the drain loop (below),
+  so the queue only ever holds semantic `progress` + the sentinel. This removes the earlier
+  (inconsistent) "evict oldest keepalive" scheme: there is nothing to evict because producers
+  block on a full queue instead of dropping.
+
+### Streaming orchestrator: `cognee/api/v1/recall/stream.py` (`stream_recall_ndjson(...)`)
+
+Async generator yielding NDJSON lines. A wrapper runs the recall coroutine and, in its own
+`finally`, enqueues the **sentinel** *after* the recall body has produced its result or raised
+— so by the time the consumer dequeues the sentinel, the task is returning and awaiting it
+resolves immediately. This removes any "sentinel dequeued but task not yet `done()`" race: the
+sentinel alone is authoritative; the loop never re-reads the queue after seeing it.
+
+1. Enter `progress_scope()`.
+2. Launch the wrapper as an `asyncio.Task` (`recall_task`). The wrapper: `try` run
+   `cognee_recall(...)`, capture the return value; `except` capture the exception; `finally`
+   `await queue.put(SENTINEL)`.
+3. Drain loop, stamping `seq` on every yielded line:
+   - **Keepalive enabled** (`interval > 0`): `try: item = await asyncio.wait_for(queue.get(),
+     timeout=interval) except TimeoutError: yield keepalive; continue`.
+   - **Keepalive disabled** (`interval <= 0`): `item = await queue.get()` — **no timeout**, so
+     no keepalives and no spin.
+   - If `item` is a `progress` event: yield it.
+   - If `item` is the **sentinel**: stop reading the queue, `await recall_task` to retrieve the
+     captured result/exception, yield exactly one terminal `result` (or `error` via the mapper),
+     then return.
+4. **Cancellation / cleanup (`finally`):** on generator close/GC (client disconnect,
+   `StreamingResponse` cancellation) or any exit, if `recall_task` is still running `cancel()`
+   it, then **await it while concurrently draining the queue**. Draining is essential under
+   backpressure: producers (and the wrapper's `finally: await queue.put(SENTINEL)`) block on a
+   full bounded queue when the consumer stops reading; cancelling the task unwinds it into that
+   same blocking `put`, so without a drainer `await recall_task` would wait on a task that is
+   itself waiting for queue capacity that never frees — a deadlock. Concretely: start a small
+   drainer (`while True: await queue.get()` discarding items) alongside `await recall_task`;
+   once the task completes, cancel the drainer. **Any non-`CancelledError` task exception is
+   observed and logged, then suppressed** — nothing is re-raised from `finally`, so no exception
+   escapes the generator (consistent with the terminal-`error` contract). Then reset the
+   `progress_scope`. This guarantees bounded-time termination with no orphaned DB/LLM work, no
+   unretrieved task exception, and no deadlock even when the queue is full at disconnect.
+
+Starlette cancels the response iterator on disconnect, which propagates into this generator;
+because the recall work runs in a **separate** task, the `finally` block is what actually stops
+it. A disconnect/cancel test asserts the child task terminates and the contextvar is reset; a
+separate test pauses the producer *after* sentinel insertion but *before* task return to prove
+termination does not hang.
+
+### Touched, minimally
+
+- `cognee/api/v1/recall/routers/get_recall_router.py` — content-negotiation branch.
+- `cognee/api/v1/recall/recall.py` — `await emit(...)` at the source-loop stage boundaries
+  (`session`, `trace`, `session_context`, `routing`, `normalization`) and a coarse `remote`
+  stage around the `get_remote_client().recall(...)` early return.
+- `cognee/modules/search/methods/get_retriever_output.py` — `await emit(...)` at the existing
+  `new_span` phases → `graph_retrieval` (get_objects + get_context) and `llm_generation`
+  (get_completion), placed **after** the `should_answer` early-return check.
+- `cognee-mcp/src/cognee_client.py` — `recall()` sends `Accept: application/x-ndjson`,
+  consumes the stream, collapses to the final result.
+
+### Data flow
+
+```
+route (Accept: application/x-ndjson)
+  └─ progress_scope()  ── sets contextvar ─┐
+  └─ task: cognee_recall(...)              │  await emit() is a no-op if contextvar unset
+        recall(): emit(session/trace/session_context/routing/normalization | remote)
+        get_retriever_output(): emit(graph_retrieval/llm_generation)
+                                           ├──▶ bounded asyncio.Queue (backpressured)
+                                           │         │
+   drain loop: get(timeout=interval) ──────┘         ▼
+     event      → yield line                    NDJSON lines
+     timeout    → yield keepalive
+     sentinel+done → yield terminal result/error
+  finally: cancel+await recall_task, reset scope
+```
+
+The synchronous JSON path never enters `progress_scope()`, so `emit()` is always a no-op
+there.
+
+## Event schema
+
+Each line is one JSON object with a `type`:
+
+```jsonc
+// progress — one per stage boundary
+{"type":"progress","stage":"routing","status":"completed","seq":4,
+ "detail":{"search_type":"GRAPH_COMPLETION","confidence":3.0}}
+// keepalive — time-based liveness, no semantics (emitted by the drain loop)
+{"type":"keepalive","seq":7,"elapsed_ms":20000}
+// terminal — exactly one, always last
+{"type":"result","data":[ /* list[RecallResponse], identical to the JSON body */ ]}
+// ...or on failure:
+{"type":"error","status_code":409,"message":"An error occurred during recall.",
+ "stage":"llm_generation" /* OPTIONAL — see error handling */}
+```
+
+- `status` ∈ `started` | `completed`. Skipped/short-circuited stages emit neither.
+- `seq` — monotonic counter stamped by the drain loop (the single output boundary) on every
+  line — `progress`, `keepalive`, and terminal — so the sequence is globally ordered and
+  gap-free even though keepalives are generated outside the producer queue.
+- `detail` — small, stage-specific, optional. Never large payloads (no context dumps, no
+  vectors).
+
+### Consumer invariants (explicit contract)
+
+- Exactly **one** terminal event (`result` | `error`) is always emitted and is always last.
+- A terminal event **closes all open stages**: a `started` may legitimately have **no matching
+  `completed`** when (a) the stage short-circuits (e.g. early session-turn answer bypasses
+  retrieval/completion), or (b) an error terminates the stream mid-stage. Consumers must not
+  assume every `started` is paired.
+- Under concurrent per-dataset fan-out, `graph_retrieval`/`llm_generation` may appear more than
+  once and interleave; each carries `detail.dataset` to disambiguate.
+
+## Stage → emission point mapping
+
+| Stage | Emitted from | detail / notes |
+|-------|--------------|----------------|
+| `session` | `recall._run_session` | completed: `{count}` |
+| `trace` | `recall._run_trace` | completed: `{count}` |
+| `session_context` | `recall._run_session_context` | completed: `{count}` |
+| `routing` | `recall._run_graph` after `route_query()` (recall.py L540-549) | completed: `{search_type, confidence}`; `overridden: true` when an explicit `query_type` bypasses routing |
+| `graph_retrieval` | `get_retriever_output` around `get_retrieved_objects` + `get_context_from_objects` (L65-89), **after** the `should_answer` check (L47-61) | completed: `{object_count}`; **not emitted** on the early-answer path |
+| `llm_generation` | `get_retriever_output` around `get_completion_from_context` (L94-106) | `started` only; **skipped** when `only_context=True` or on the early-answer path |
+| `normalization` | `recall._run_graph` around `normalize_search_payload` tagging (L592-598) | completed: `{result_count}` |
+| `remote` | `recall()` around the `get_remote_client().recall(...)` early return (L456-474) | coarse started/completed; see remote caveat |
+
+**Concurrency:** with `ENABLE_BACKEND_ACCESS_CONTROL=false` (target deployment) the
+non-access-control branch runs a single retriever pass, so graph stages fire once. Under access
+control, `search_in_datasets_context` fans out per dataset via `asyncio.gather` (search.py
+L382), so graph stages repeat/interleave with `detail.dataset` set. The contextvar propagates
+into those tasks automatically (`asyncio` tasks copy the current context).
+
+**Remote-path caveat:** when a remote client is configured, `recall()` returns early
+(recall.py L456-474) and the local source-loop / graph emits never run. On that path only the
+coarse `remote` stage + keepalives + terminal are available, unless the remote protocol itself
+streams stages (out of scope). The target self-hosted deployment does not take this path.
+
+## Content negotiation
+
+- Add `request: Request` to the `recall` handler (get_recall_router.py L128-130).
+- **Parse the `Accept` header properly** (media ranges + `q` values); do not substring-match.
+  Streaming is selected **iff** `application/x-ndjson` is present with an effective `q > 0`.
+  Deterministic matrix:
+  | `Accept` | Representation |
+  |----------|----------------|
+  | absent / `*/*` / `application/json` | JSON (default) |
+  | `application/x-ndjson` (`q` default 1) | NDJSON |
+  | `application/x-ndjson;q=0` | JSON (explicitly refused) |
+  | `application/json, application/x-ndjson` | NDJSON (both acceptable; explicit ndjson wins over `*/*`-style defaults) |
+  | `text/event-stream` | JSON for v1 (SSE is a possible follow-up) |
+- Streaming branch: `StreamingResponse(gen(), media_type="application/x-ndjson")` with
+  `X-Accel-Buffering: no` and `Cache-Control: no-cache` so intermediaries don't buffer.
+- Default branch: unchanged (`jsonable_encoder(results)`), same DTO, same auth dependency.
+
+## Error handling
+
+A `StreamingResponse` has already sent `200 OK`, so status cannot change mid-stream.
+
+- **Before streaming starts:** auth (`Depends`) and DTO validation run before the handler body,
+  so those keep normal HTTP status codes.
+- **After streaming starts:** the terminal-`error` mapper mirrors the JSON branch **exactly**,
+  including preserving each exception's effective `status_code` rather than a fixed value:
+  - `LLMPaymentRequiredError` → 402
+  - `DatabaseNotCreatedError` / `UserNotFoundError` / `CogneeValidationError` →
+    `getattr(e, "status_code", 422)` — **not a hardcoded 422**. Subclasses carry their own code
+    (e.g. `DatasetNotFoundError` is a `CogneeValidationError` with `status_code=404`;
+    `cognee/modules/data/exceptions/exceptions.py`), and the streaming representation must
+    report the same 404 the JSON branch does.
+  - `PermissionDeniedError` → terminal `result` with empty `data` (mirrors the JSON branch's
+    empty-list behavior)
+  - generic `Exception` → 409
+- **Error stage attribution:** the top-level orchestrator sees only the raised exception and
+  **cannot reliably infer the active stage** (multiple stages may be active under fan-out).
+  Therefore `error.stage` is **optional**: it is set only when the failing layer attaches stage
+  context at the failure site (e.g. an error emitted from `get_retriever_output` with its stage
+  + `dataset`). The generic top-level handler omits `stage`. Tests cover failures in routing,
+  retrieval, completion, normalization, and a concurrent-dataset failure.
+- Exactly one terminal event always closes the stream — no half-open streams, no exception
+  escaping the generator.
+
+### MCP client exception contract
+
+`CogneeClient.recall` maps a terminal `error` event to a raised exception that **carries
+`status_code`** (and `message`, optional `stage`), so callers can distinguish a mapped
+402/422 failure from a generic 409. A terminal `result` (including the empty-list
+permission-denied case) returns normally.
+
+## MCP client consumption
+
+`CogneeClient.recall` (cognee_client.py L532-552):
+
+- Sends `Accept: application/x-ndjson`; uses `client.stream("POST", ...)` and iterates
+  `response.aiter_lines()`, parsing each JSON line.
+- For issue #2: **ignores** `progress`/`keepalive` events; returns the `result` event's `data`;
+  raises the typed exception above on a terminal `error`. (Issue #1 swaps "ignore" for "relay
+  as MCP progress notifications".)
+- **Back-compat:** if the response `Content-Type` is `application/json` (older backend that
+  ignored `Accept`), fall back to the existing `response.json()` path. A new MCP against an old
+  API still works.
+
+## Configuration
+
+- `COGNEE_RECALL_KEEPALIVE_INTERVAL` — keepalive period in seconds (default `10`). A value
+  `<= 0` **disables** keepalives: the drain loop then awaits `queue.get()` with no timeout
+  (never the degenerate `wait_for(..., timeout=0)` that would spin). Disabled means zero
+  keepalive lines, even inside a long stage.
+- Bounded queue size — internal constant; because producers await on `put`, size affects
+  backpressure sensitivity only, never correctness (no event is dropped).
+
+## Testing
+
+- **Unit (API):**
+  - JSON branch unchanged when no `Accept` header (response equals current behavior).
+  - NDJSON branch emits ordered `progress` stages + exactly one terminal `result`.
+  - Injected failure yields a terminal `error` with the correct `status_code`; no exception
+    escapes the generator.
+  - A slow stage (mocked) produces ≥1 `keepalive` when the interval is enabled.
+  - **Keepalive disabled (`interval <= 0`):** a slow stage produces **zero** keepalive lines
+    and does not spin (drain loop awaits without a timeout).
+  - **Sentinel termination race:** producer paused *after* enqueuing the sentinel but *before*
+    the task returns — the stream still terminates deterministically (does not emit keepalives
+    forever).
+  - **Cancellation:** simulated client disconnect cancels + awaits the recall task (assert it
+    terminates) and resets the progress scope; a non-cancellation task exception is logged and
+    suppressed, and no exception escapes the generator.
+  - **Saturation + disconnect (deadlock guard):** fill the bounded queue to capacity, then
+    cancel the response iterator — assert termination in bounded time (cleanup drains the queue
+    so the producer's blocked `put`/sentinel unblocks) and the progress scope resets. This is
+    the combined case the separate saturation and cancellation tests do not prove.
+  - **`seq` monotonicity:** across a run mixing `progress`, `keepalive`, and the terminal event,
+    `seq` is strictly increasing and gap-free.
+  - **Status-code preservation:** a `DatasetNotFoundError` (validation subclass, 404) yields a
+    terminal `error` with `status_code: 404`, matching the JSON branch — not 422.
+  - **Saturation/backpressure:** many concurrent datasets emitting more progress events than the
+    queue bound — assert **no progress event is lost** (producers block, drain catches up) and
+    ordering per dataset is preserved.
+  - **Content negotiation matrix:** the table above, including `q=0` → JSON and multi-range
+    headers.
+  - **started/terminal invariant:** early session-turn answer path emits neither
+    `graph_retrieval` nor `llm_generation`; a mid-stage error leaves an unpaired `started`
+    followed by exactly one terminal `error`.
+- **Unit (emitter):** `emit()` is a no-op with no scope; events enqueue/await in order within a
+  scope; contextvar propagates into `asyncio.create_task`; sentinel handling.
+- **Unit (MCP client):** fed a canned NDJSON stream, `recall()` returns the `result` data and
+  ignores progress/keepalive; terminal `error` raises the typed exception with `status_code`;
+  JSON fallback path still works.
+- **Integration:** end-to-end recall over NDJSON returns a result payload equal to the JSON
+  path's for the same query.
+
+## Risks & mitigations
+
+- **Stream hangs forever (sentinel/completion race)** → sentinel is authoritative and enqueued
+  from the wrapper's `finally` after the body completes; on dequeue the loop stops reading and
+  awaits the task. Race test pauses the producer between sentinel insertion and task return.
+- **Keepalive spin at `interval=0`** → disabled branch awaits `queue.get()` untimed; test
+  asserts zero keepalives.
+- **`seq` collision/reorder** → single output-boundary sequencer stamps every line; monotonicity
+  test.
+- **Status-code drift between representations** → mapper uses `getattr(e, "status_code", 422)`
+  exactly like the JSON branch; non-422 subclass test (404).
+- **Deadlock on disconnect with a full queue** → cleanup drains the queue concurrently while
+  awaiting the cancelled task, so a producer/sentinel blocked on `await put()` unblocks; combined
+  saturation+disconnect test proves bounded-time termination.
+- **Orphaned recall work on client disconnect** → `finally` cancels + awaits the recall task and
+  observes/logs (then suppresses) its exception; covered by the cancellation test.
+- **Backpressure / lost progress under fan-out** → awaited bounded `put` (producers block, never
+  drop); keepalives generated by the drain loop, not queued; saturation test proves no loss.
+- **Unreliable error stage under concurrency** → `error.stage` optional, set only at the failure
+  site; generic handler omits it.
+- **Contextvar not propagating into per-dataset tasks** → `asyncio` tasks copy the current
+  context; emitter unit test.
+- **Buffering proxies defeating liveness** → `X-Accel-Buffering: no` + `Cache-Control: no-cache`;
+  NDJSON flushed per line.
+- **Behavioral drift on the JSON path** → `emit()` no-op when unscoped; explicit test that the
+  JSON branch output is unchanged.
+- **Remote path yields no semantic stages** → documented; coarse `remote` stage + keepalives;
+  not taken by the target deployment.

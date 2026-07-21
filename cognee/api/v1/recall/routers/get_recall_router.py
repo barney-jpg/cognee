@@ -2,14 +2,19 @@ from datetime import datetime
 from typing import List, Optional, Union
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 
 from cognee import __version__ as cognee_version
 from cognee.api.DTO import InDTO, OutDTO
 from cognee.api.v1.recall.recall import RecallResponse
+from cognee.api.v1.recall.stream import (
+    NDJSON_MEDIA_TYPE,
+    accept_prefers_ndjson,
+    stream_recall_ndjson,
+)
 from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
 from cognee.infrastructure.llm.exceptions import LLMPaymentRequiredError
@@ -127,7 +132,11 @@ def get_recall_router() -> APIRouter:
 
     @router.post("", response_model=list[RecallResponse])
     @log_usage(function_name="POST /v1/recall", log_type="api_endpoint")
-    async def recall(payload: RecallPayloadDTO, user: User = Depends(get_authenticated_user)):
+    async def recall(
+        payload: RecallPayloadDTO,
+        request: Request,
+        user: User = Depends(get_authenticated_user),
+    ):
         """
         Recall information from the knowledge graph.
 
@@ -173,25 +182,41 @@ def get_recall_router() -> APIRouter:
             },
         )
 
-        from cognee.api.v1.recall import recall as cognee_recall
+        recall_kwargs = dict(
+            query_text=payload.query,
+            query_type=payload.search_type,
+            user=user,
+            datasets=payload.datasets,
+            dataset_ids=payload.dataset_ids,
+            system_prompt=payload.system_prompt,
+            node_name=payload.node_name,
+            top_k=payload.top_k,
+            verbose=payload.verbose,
+            only_context=payload.only_context,
+            session_id=payload.session_id,
+            scope=payload.scope,
+            context_profile=payload.context_profile,
+            include_references=payload.include_references,
+        )
+
+        # Content negotiation: stream NDJSON only when the client explicitly opts in via Accept.
+        # The default JSON representation below is byte-for-byte unchanged.
+        if accept_prefers_ndjson(request.headers.get("accept")):
+            return StreamingResponse(
+                stream_recall_ndjson(recall_kwargs=recall_kwargs),
+                media_type=NDJSON_MEDIA_TYPE,
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+
+        # Resolve lazily via importlib to break the import cycle and reliably get the package
+        # MODULE (not the re-exported function that `import x.y.z as m` can bind under cognee's
+        # package shadowing), reading its current `recall` — which stays monkeypatchable in tests.
+        import importlib
+
+        cognee_recall_pkg = importlib.import_module("cognee.api.v1.recall")
 
         try:
-            results = await cognee_recall(
-                query_text=payload.query,
-                query_type=payload.search_type,
-                user=user,
-                datasets=payload.datasets,
-                dataset_ids=payload.dataset_ids,
-                system_prompt=payload.system_prompt,
-                node_name=payload.node_name,
-                top_k=payload.top_k,
-                verbose=payload.verbose,
-                only_context=payload.only_context,
-                session_id=payload.session_id,
-                scope=payload.scope,
-                context_profile=payload.context_profile,
-                include_references=payload.include_references,
-            )
+            results = await cognee_recall_pkg.recall(**recall_kwargs)
             return jsonable_encoder(results)
         except LLMPaymentRequiredError as error:
             return JSONResponse(

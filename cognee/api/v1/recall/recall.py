@@ -35,6 +35,7 @@ from cognee.modules.recall.types.RecallResponse import (
 from cognee.modules.recall.types.SearchResultItem import SearchResultItem
 from cognee.modules.search.models.SearchResultPayload import SearchResultPayload
 from cognee.modules.search.types import SearchResult, SearchType
+from cognee.modules.recall.progress import emit
 from cognee.modules.users.exceptions.exceptions import UserNotFoundError
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
@@ -454,6 +455,9 @@ async def recall(
 
         client = get_remote_client()
         if client is not None:
+            # Remote path: the local source-loop / graph emits never run, so only this coarse
+            # stage (plus keepalives + terminal) is available unless the remote protocol streams.
+            await emit("remote", "started")
             results = await client.recall(
                 query_text,
                 query_type,
@@ -469,6 +473,7 @@ async def recall(
                 verbose=verbose,
                 include_references=include_references,
             )
+            await emit("remote", "completed", {"count": len(results) if results else 0})
             span.set_attribute(COGNEE_RECALL_SOURCE, "cloud")
             span.set_attribute(COGNEE_RESULT_COUNT, len(results) if results else 0)
             return results
@@ -535,18 +540,24 @@ async def recall(
             await set_session_user_context_variable(user)
 
             local_query_type = query_type
+            routing_detail: dict = {}
             if local_query_type is not None:
+                # An explicit query_type bypasses routing (routing still runs under auto_route to
+                # record the override, but the explicit type is used).
+                routing_detail["overridden"] = True
                 if auto_route:
                     from cognee.api.v1.recall.query_router import record_override, route_query
 
                     result = route_query(query_text)
                     routed_type = result.search_type
                     record_override(routed_type, local_query_type)
+                    routing_detail["confidence"] = result.confidence
             elif auto_route:
                 from cognee.api.v1.recall.query_router import route_query
 
                 result = route_query(query_text)
                 local_query_type = result.search_type
+                routing_detail["confidence"] = result.confidence
             else:
                 local_query_type = SearchType.GRAPH_COMPLETION
 
@@ -554,6 +565,11 @@ async def recall(
                 COGNEE_SEARCH_TYPE,
                 str(local_query_type.value) if local_query_type else "unknown",
             )
+
+            routing_detail["search_type"] = (
+                str(local_query_type.value) if local_query_type else "unknown"
+            )
+            await emit("routing", "completed", routing_detail)
 
             # Dataset UUIDs take precedence over names, matching /api/v1/search.
             # String dataset names can only resolve for the current user.
@@ -595,6 +611,7 @@ async def recall(
                 tagged.extend(
                     [ResponseGraphEntry(**item.model_dump(), source="graph") for item in items]
                 )
+            await emit("normalization", "completed", {"result_count": len(tagged)})
             return tagged
 
         runners = {
@@ -613,6 +630,8 @@ async def recall(
             if auto_fallthrough and src == "graph" and merged:
                 break
             part = await runner()
+            if src in ("session", "trace", "session_context"):
+                await emit(src, "completed", {"count": len(part)})
             if src == "session":
                 session_result_count = len(part)
             merged.extend(part)
