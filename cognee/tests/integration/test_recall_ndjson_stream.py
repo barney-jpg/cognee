@@ -6,6 +6,7 @@ runs without a real graph/LLM. Asserts the NDJSON payload equals the JSON path's
 query and that the documented stream invariants hold.
 """
 
+import importlib
 import json
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,12 +15,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import cognee.api.v1.recall as recall_pkg
 from cognee.api.v1.recall.routers.get_recall_router import get_recall_router
 from cognee.api.v1.recall.stream import NDJSON_MEDIA_TYPE
 from cognee.modules.recall.progress import emit
 from cognee.modules.recall.types.RecallResponse import ResponseSessionContextEntry
 from cognee.modules.users.methods import get_authenticated_user
+
+# Import the package module object robustly — `import x.y.z as m` can bind the re-exported
+# function instead of the module under cognee's package shadowing, which breaks monkeypatch.
+recall_pkg = importlib.import_module("cognee.api.v1.recall")
 
 MOCK_USER = SimpleNamespace(id=uuid4(), email="t@example.com", is_active=True, tenant_id=uuid4())
 
@@ -40,7 +44,7 @@ def _parse_ndjson(text):
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-def test_ndjson_payload_equals_json_payload(client):
+def test_ndjson_payload_equals_json_payload(client, monkeypatch):
     payload = [
         ResponseSessionContextEntry(
             source="session_context", content="answer", context_profile="qa"
@@ -53,7 +57,7 @@ def test_ndjson_payload_equals_json_payload(client):
         await emit("llm_generation", "started")
         return payload
 
-    recall_pkg.recall = fake_recall
+    monkeypatch.setattr(recall_pkg, "recall", fake_recall)
 
     json_resp = client.post("/recall", json={"query": "q"})
     ndjson_resp = client.post("/recall", json={"query": "q"}, headers={"Accept": NDJSON_MEDIA_TYPE})
@@ -66,14 +70,14 @@ def test_ndjson_payload_equals_json_payload(client):
     assert events[-1]["data"] == json_resp.json()
 
 
-def test_stream_invariants_hold(client):
+def test_stream_invariants_hold(client, monkeypatch):
     async def fake_recall(**kwargs):
         await emit("routing", "completed", {"search_type": "GRAPH_COMPLETION"})
         await emit("graph_retrieval", "completed", {"object_count": 2})
         await emit("llm_generation", "started")
         return []
 
-    recall_pkg.recall = fake_recall
+    monkeypatch.setattr(recall_pkg, "recall", fake_recall)
 
     resp = client.post("/recall", json={"query": "q"}, headers={"Accept": NDJSON_MEDIA_TYPE})
     events = _parse_ndjson(resp.text)
@@ -92,12 +96,12 @@ def test_stream_invariants_hold(client):
     assert ("llm_generation", "started") in stages
 
 
-def test_mid_stage_error_leaves_unpaired_started_then_one_terminal_error(client):
+def test_mid_stage_error_leaves_unpaired_started_then_one_terminal_error(client, monkeypatch):
     async def fake_recall(**kwargs):
         await emit("llm_generation", "started")  # started with no matching completed
         raise RuntimeError("boom")
 
-    recall_pkg.recall = fake_recall
+    monkeypatch.setattr(recall_pkg, "recall", fake_recall)
 
     resp = client.post("/recall", json={"query": "q"}, headers={"Accept": NDJSON_MEDIA_TYPE})
     events = _parse_ndjson(resp.text)

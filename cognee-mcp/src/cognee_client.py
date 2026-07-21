@@ -553,6 +553,7 @@ class CogneeClient:
         search_type: Optional[str] = None,
         datasets: Optional[List[str]] = None,
         session_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
         top_k: int = 15,
     ) -> Any:
         """Search memory via recall() with auto-routing and session awareness."""
@@ -565,21 +566,27 @@ class CogneeClient:
                 payload["datasets"] = datasets
             if session_id:
                 payload["session_id"] = session_id
+            if system_prompt:
+                payload["system_prompt"] = system_prompt
 
             headers = self._get_headers()
             headers["Accept"] = NDJSON_MEDIA_TYPE
             async with self.client.stream(
                 "POST", endpoint, json=payload, headers=headers
             ) as response:
-                content_type = response.headers.get("content-type", "")
-                if NDJSON_MEDIA_TYPE not in content_type:
+                # Parse the media-type token case-insensitively, ignoring any ;charset suffix.
+                media_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+                if media_type != NDJSON_MEDIA_TYPE:
                     # Back-compat: an older backend ignored Accept and returned a JSON body.
                     await response.aread()
                     response.raise_for_status()
                     return response.json()
 
                 # Streaming path: 200 already sent, so failures arrive as a terminal error
-                # event. Ignore progress/keepalive; return the result data (issue #2).
+                # event. Ignore progress/keepalive; return the result data (issue #2). Enforce
+                # the protocol's exactly-one-terminal contract so a truncated stream (proxy
+                # reset, crash, premature close) fails loud instead of a silent None success.
+                terminal_seen = False
                 result_data: Any = None
                 async for line in response.aiter_lines():
                     line = line.strip()
@@ -588,14 +595,24 @@ class CogneeClient:
                     event = json.loads(line)
                     event_type = event.get("type")
                     if event_type == "result":
-                        result_data = event.get("data")
+                        if terminal_seen:
+                            raise RecallError("Recall stream returned multiple terminal events.")
+                        if "data" not in event:
+                            raise RecallError("Recall stream terminal 'result' is missing 'data'.")
+                        terminal_seen = True
+                        result_data = event["data"]
                     elif event_type == "error":
+                        # Terminal error: fail loud with the mapped status_code.
                         raise RecallError(
                             event.get("message", "An error occurred during recall."),
                             status_code=event.get("status_code"),
                             stage=event.get("stage"),
                         )
                     # progress / keepalive events are ignored for issue #2.
+                if not terminal_seen:
+                    raise RecallError(
+                        "Recall stream ended without a terminal event (truncated response)."
+                    )
                 return result_data
         else:
             with redirect_stdout(sys.stderr):
@@ -608,6 +625,8 @@ class CogneeClient:
                     kwargs["datasets"] = datasets
                 if session_id:
                     kwargs["session_id"] = session_id
+                if system_prompt:
+                    kwargs["system_prompt"] = system_prompt
                 return await self.cognee.recall(query_text=query_text, **kwargs)
 
     async def forget(

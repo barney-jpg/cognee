@@ -136,3 +136,45 @@ def test_json_fallback_for_old_backend():
     client, _ = _client_with(resp)
 
     assert asyncio.run(client.recall("q")) == [{"answer": "legacy"}]
+
+
+def test_truncated_stream_raises():
+    # Stream ends without any terminal event (proxy reset / crash): must fail loud, not return
+    # a silent None success.
+    lines = [json.dumps({"type": "progress", "stage": "routing", "status": "completed", "seq": 1})]
+    resp = _FakeResponse({"content-type": NDJSON_MEDIA_TYPE}, lines=lines)
+    client, _ = _client_with(resp)
+
+    with pytest.raises(RecallError):
+        asyncio.run(client.recall("q"))
+
+
+def test_terminal_result_missing_data_raises():
+    lines = [json.dumps({"type": "result", "seq": 1})]  # malformed terminal: no "data"
+    resp = _FakeResponse({"content-type": NDJSON_MEDIA_TYPE}, lines=lines)
+    client, _ = _client_with(resp)
+
+    with pytest.raises(RecallError):
+        asyncio.run(client.recall("q"))
+
+
+def test_multiple_terminals_raise():
+    lines = [
+        json.dumps({"type": "result", "data": [1], "seq": 1}),
+        json.dumps({"type": "result", "data": [2], "seq": 2}),
+    ]
+    resp = _FakeResponse({"content-type": NDJSON_MEDIA_TYPE}, lines=lines)
+    client, _ = _client_with(resp)
+
+    with pytest.raises(RecallError):
+        asyncio.run(client.recall("q"))
+
+
+def test_content_type_is_case_insensitive_with_charset():
+    # A valid, differently-cased media type (with a charset param) must still stream, not fall
+    # through to the legacy JSON path.
+    lines = [json.dumps({"type": "result", "data": [{"ok": True}], "seq": 1})]
+    resp = _FakeResponse({"content-type": "Application/X-NDJSON; charset=utf-8"}, lines=lines)
+    client, _ = _client_with(resp)
+
+    assert asyncio.run(client.recall("q")) == [{"ok": True}]

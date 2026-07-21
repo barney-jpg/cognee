@@ -208,9 +208,12 @@ def get_recall_router() -> APIRouter:
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
             )
 
-        # Lazy attribute access (not a from-import) breaks the import cycle and keeps the
-        # function monkeypatchable in tests (see stream.py for the same rationale).
-        import cognee.api.v1.recall as cognee_recall_pkg
+        # Resolve lazily via importlib to break the import cycle and reliably get the package
+        # MODULE (not the re-exported function that `import x.y.z as m` can bind under cognee's
+        # package shadowing), reading its current `recall` — which stays monkeypatchable in tests.
+        import importlib
+
+        cognee_recall_pkg = importlib.import_module("cognee.api.v1.recall")
 
         try:
             results = await cognee_recall_pkg.recall(**recall_kwargs)

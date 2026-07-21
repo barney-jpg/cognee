@@ -4,6 +4,7 @@ Covers the Accept-parsing matrix at the unit level plus endpoint-level assertion
 default JSON representation is unchanged and NDJSON is served only on explicit opt-in.
 """
 
+import importlib
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,10 +14,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import cognee.api.v1.recall as recall_pkg
 from cognee.api.v1.recall.routers.get_recall_router import get_recall_router
 from cognee.api.v1.recall.stream import NDJSON_MEDIA_TYPE, accept_prefers_ndjson
 from cognee.modules.users.methods import get_authenticated_user
+
+# Import the package module object robustly — `import x.y.z as m` can bind the re-exported
+# function instead of the module under cognee's package shadowing, which breaks monkeypatch.
+recall_pkg = importlib.import_module("cognee.api.v1.recall")
 
 MOCK_USER = SimpleNamespace(id=uuid4(), email="test@example.com", is_active=True, tenant_id=uuid4())
 
@@ -55,16 +59,16 @@ def client():
     return TestClient(app)
 
 
-def test_default_is_json_unchanged(client):
-    recall_pkg.recall = AsyncMock(return_value=[])
+def test_default_is_json_unchanged(client, monkeypatch):
+    monkeypatch.setattr(recall_pkg, "recall", AsyncMock(return_value=[]))
     resp = client.post("/recall", json={"query": "hi"})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
     assert resp.json() == []
 
 
-def test_ndjson_accept_streams(client):
-    recall_pkg.recall = AsyncMock(return_value=[])
+def test_ndjson_accept_streams(client, monkeypatch):
+    monkeypatch.setattr(recall_pkg, "recall", AsyncMock(return_value=[]))
     resp = client.post("/recall", json={"query": "hi"}, headers={"Accept": NDJSON_MEDIA_TYPE})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith(NDJSON_MEDIA_TYPE)
@@ -76,8 +80,8 @@ def test_ndjson_accept_streams(client):
     assert lines[-1]["data"] == []
 
 
-def test_q_zero_falls_back_to_json(client):
-    recall_pkg.recall = AsyncMock(return_value=[])
+def test_q_zero_falls_back_to_json(client, monkeypatch):
+    monkeypatch.setattr(recall_pkg, "recall", AsyncMock(return_value=[]))
     resp = client.post(
         "/recall", json={"query": "hi"}, headers={"Accept": "application/x-ndjson;q=0"}
     )

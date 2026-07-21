@@ -160,11 +160,12 @@ async def stream_recall_ndjson(
     if keepalive_interval is None:
         keepalive_interval = resolve_keepalive_interval()
     if recall_fn is None:
-        # Lazy attribute access (not a from-import) breaks the import cycle and stays patchable:
-        # `from pkg import recall` re-runs _handle_fromlist and would reset a test's monkeypatch.
-        import cognee.api.v1.recall as _recall_pkg
+        # Resolve lazily to break the import cycle, via importlib so we reliably get the package
+        # MODULE (not the re-exported function that `import x.y.z as m` can bind under cognee's
+        # package shadowing) and read its current `recall` attribute — which stays patchable.
+        import importlib
 
-        recall_fn = _recall_pkg.recall
+        recall_fn = importlib.import_module("cognee.api.v1.recall").recall
 
     start = time.monotonic()
     seq = 0
