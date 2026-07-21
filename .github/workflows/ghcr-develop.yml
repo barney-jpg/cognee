@@ -8,7 +8,7 @@ name: build | Publish dev images to GHCR
 
 on:
   push:
-    branches: [develop]
+    branches: [develop, feature/ghcr-develop-images]
   workflow_dispatch: {}
 
 concurrency:
