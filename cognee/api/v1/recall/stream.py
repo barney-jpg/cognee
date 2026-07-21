@@ -143,6 +143,49 @@ async def _drain(queue: "asyncio.Queue[Any]") -> None:
         await queue.get()
 
 
+def _keepalive_event(seq: int, start: float) -> dict:
+    """Build a time-based keepalive event (seq already assigned by the drain loop)."""
+    return {"type": "keepalive", "seq": seq, "elapsed_ms": int((time.monotonic() - start) * 1000)}
+
+
+def _build_terminal(outcome: dict) -> dict:
+    """Construct the single terminal event (without seq) from the recall task's outcome.
+
+    ``outcome`` carries ``result`` on success or ``error`` on failure; if the body was cancelled
+    before settling it carries neither, which maps to a generic terminal error.
+    """
+    if "error" in outcome:
+        return map_exception_to_terminal(outcome["error"])
+    if "result" in outcome:
+        return {"type": "result", "data": jsonable_encoder(outcome["result"])}
+    return map_exception_to_terminal(RuntimeError("recall cancelled"))
+
+
+async def _cancel_and_drain(recall_task: "asyncio.Task", queue: "asyncio.Queue[Any]") -> None:
+    """Stop the recall task on generator close/disconnect without orphaning work or deadlocking.
+
+    A producer (or the wrapper's sentinel ``put``) may be blocked on a full bounded queue, so the
+    cancelled task is awaited while a drainer concurrently empties the queue. Non-``CancelledError``
+    task exceptions are logged and suppressed — nothing is re-raised from the generator.
+    """
+    if recall_task.done():
+        return
+    recall_task.cancel()
+    drainer = asyncio.create_task(_drain(queue))
+    try:
+        await recall_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — observed, logged, suppressed
+        logger.error("Recall task failed during stream cleanup: %s", exc, exc_info=True)
+    finally:
+        drainer.cancel()
+        try:
+            await drainer
+        except asyncio.CancelledError:
+            pass
+
+
 async def stream_recall_ndjson(
     *,
     recall_kwargs: dict,
@@ -193,8 +236,7 @@ async def stream_recall_ndjson(
                         item = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
                     except asyncio.TimeoutError:
                         seq += 1
-                        elapsed_ms = int((time.monotonic() - start) * 1000)
-                        yield _line({"type": "keepalive", "seq": seq, "elapsed_ms": elapsed_ms})
+                        yield _line(_keepalive_event(seq, start))
                         continue
                 else:
                     # Disabled: untimed get(), so no keepalives and no spin.
@@ -210,13 +252,7 @@ async def stream_recall_ndjson(
                     except asyncio.CancelledError:
                         pass
                     seq += 1
-                    if "error" in outcome:
-                        terminal = map_exception_to_terminal(outcome["error"])
-                    elif "result" in outcome:
-                        terminal = {"type": "result", "data": jsonable_encoder(outcome["result"])}
-                    else:
-                        # Body cancelled before settling: no result and no captured error.
-                        terminal = map_exception_to_terminal(RuntimeError("recall cancelled"))
+                    terminal = _build_terminal(outcome)
                     terminal["seq"] = seq
                     yield _line(terminal)
                     return
@@ -228,18 +264,4 @@ async def stream_recall_ndjson(
         finally:
             # Client disconnect / GC: stop the recall task without orphaning DB/LLM work and
             # without deadlocking on a full queue (drain concurrently while awaiting).
-            if not recall_task.done():
-                recall_task.cancel()
-                drainer = asyncio.create_task(_drain(queue))
-                try:
-                    await recall_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:  # noqa: BLE001 — observed, logged, suppressed
-                    logger.error("Recall task failed during stream cleanup: %s", exc, exc_info=True)
-                finally:
-                    drainer.cancel()
-                    try:
-                        await drainer
-                    except asyncio.CancelledError:
-                        pass
+            await _cancel_and_drain(recall_task, queue)
