@@ -61,9 +61,20 @@ def client():
 
 def test_default_is_json_unchanged(client, monkeypatch):
     monkeypatch.setattr(recall_pkg, "recall", AsyncMock(return_value=[]))
-    resp = client.post("/recall", json={"query": "hi"})
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("application/json")
+    # The JSON body must be byte-for-byte identical across every Accept that selects JSON, i.e.
+    # the content-negotiation branch never alters the default representation.
+    bodies = []
+    for headers in (
+        {},
+        {"Accept": "*/*"},
+        {"Accept": "application/json"},
+        {"Accept": "application/x-ndjson;q=0"},
+    ):
+        resp = client.post("/recall", json={"query": "hi"}, headers=headers)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/json")
+        bodies.append(resp.content)
+    assert len(set(bodies)) == 1  # identical raw bytes
     assert resp.json() == []
 
 
