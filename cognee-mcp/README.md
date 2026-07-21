@@ -95,6 +95,12 @@ Please refer to our documentation [here](https://docs.cognee.ai/how-to-guides/de
 You can do more advanced configurations by creating .env file using our <a href="https://github.com/topoteretes/cognee/blob/main/.env.template">template.</a>
 To use different LLM providers / database configurations, and for more info check out our <a href="https://docs.cognee.ai">documentation</a>.
 
+> **No API key?** If your MCP host grants the `sampling` capability, `LLM_PROVIDER="mcp-sampling"`
+> delegates completions to the host's own model, so no `LLM_API_KEY` is needed (embeddings still
+> need a provider). Host support varies — as of early 2026 Claude Code does not yet grant sampling
+> ([anthropics/claude-code#1785](https://github.com/anthropics/claude-code/issues/1785)). See the
+> "MCP sampling" section of the .env template.
+
 
 ## 🐳 Docker Usage
 
@@ -518,17 +524,22 @@ COGNEE_MCP_AGENT_SCOPED=false
 
 When disabled, the workspace UI header shows `(agent scoping off)` and no per-client datasets are autocreated.
 
-### Progress notifications (long recall/search)
+### Progress notifications (long recall)
 
-`recall` and `search` run synchronously — the tool call blocks until the full pipeline
-(graph retrieval + LLM generation) finishes. Long calls can exceed a client's per-request MCP
-timeout (e.g. LibreChat's default 60s) or an idle reverse-proxy timeout, tearing the call down
-even though the server is still working.
+`recall` runs synchronously — the tool call blocks until the full pipeline (graph retrieval +
+LLM generation) finishes. Long calls can exceed a client's per-request MCP timeout (e.g.
+LibreChat's default 60s) or an idle reverse-proxy timeout, tearing the call down even though the
+server is still working.
 
-To keep the stream active, the server emits periodic MCP `notifications/progress` while a
-`recall`/`search` runs — but only when the client includes a `progressToken` in the request
-(per the MCP spec); otherwise the tools behave exactly as before. A notification failure never
-breaks or delays the result. Configure the heartbeat period in `.env`:
+To keep the stream active, the server emits periodic MCP `notifications/progress` while `recall`
+runs — but only when the client includes a `progressToken` in the request (per the MCP spec);
+otherwise the tool behaves exactly as before. A notification failure never breaks or delays the
+result.
+
+This reliably keeps idle transports alive, and per the MCP spec a client **may** reset its
+per-request timeout when matching progress arrives — but the spec also says clients **should**
+still enforce a maximum, so this reduces (does not universally eliminate) client-side timeouts.
+Configure the heartbeat period in `.env`:
 
 ```bash
 # Progress heartbeat interval in seconds (default 5). Set to 0 to disable.

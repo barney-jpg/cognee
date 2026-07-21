@@ -80,12 +80,14 @@ cognee_client: Optional[CogneeClient] = None
 # ---------------------------------------------------------------------------
 # Progress notifications (issue #1)
 # ---------------------------------------------------------------------------
-# Long recall/search calls carry no data while running, tripping client MCP request
-# timeouts and idle-based reverse-proxy timeouts. A background heartbeat emits
-# `notifications/progress` at a configured interval so the stream stays active and clients
-# that render progress get a "still working" signal — without changing the synchronous
-# return contract. A blind tick for now; once the recall API streams real stages (companion
-# NDJSON work), this can relay actual stages instead.
+# Long recall calls carry no data while running, which can trip idle-based reverse-proxy
+# timeouts and lets progress-aware MCP clients reset their per-request timeout (the MCP spec
+# says clients MAY do so on matching progress, while still enforcing a maximum). A background
+# heartbeat emits `notifications/progress` at a configured interval so the stream stays active
+# and clients that render progress get a "still working" signal — without changing the
+# synchronous return contract. A blind tick for now; once the recall API streams real stages
+# (companion NDJSON work), this can relay actual stages instead. Wired into recall only:
+# search() is not registered as an MCP tool, so it is unreachable over the protocol.
 
 DEFAULT_PROGRESS_INTERVAL = 5.0
 
@@ -125,31 +127,38 @@ def _progress_target():
     return getattr(ctx, "session", None), token
 
 
-async def _with_progress(coro, *, label: str):
-    """Await ``coro`` while emitting periodic progress notifications.
+async def _heartbeat(session, token, interval: float, label: str) -> None:
+    """Emit a `notifications/progress` every ``interval`` seconds until cancelled.
 
-    Runs ``coro`` unchanged when progress is disabled or no ``progressToken`` is present. A
-    notification failure is logged and never breaks or delays the tool result; the heartbeat is
-    always cancelled once the result arrives.
+    Runs against an explicit (session, token) target — the scheduling policy, decoupled from
+    context/config discovery. A send failure is logged and swallowed so progress stays
+    best-effort and never fatal to the caller.
+    """
+    n = 0
+    while True:
+        await asyncio.sleep(interval)
+        n += 1
+        try:
+            await session.send_progress_notification(
+                progress_token=token, progress=n, message=f"{label}…"
+            )
+        except Exception as exc:  # noqa: BLE001 — progress is best-effort, never fatal
+            logger.warning("Progress notification failed: %s", exc)
+
+
+async def _with_progress(coro, *, label: str):
+    """Await ``coro`` while a heartbeat emits progress notifications.
+
+    Resolves the interval (config) and the (session, token) target (request context), then runs
+    ``coro`` unchanged when progress is disabled or no ``progressToken`` is present. The heartbeat
+    is always cancelled once the result arrives.
     """
     interval = _progress_interval()
     session, token = _progress_target()
     if interval <= 0 or session is None or token is None:
         return await coro
 
-    async def _beat():
-        n = 0
-        while True:
-            await asyncio.sleep(interval)
-            n += 1
-            try:
-                await session.send_progress_notification(
-                    progress_token=token, progress=n, message=f"{label}…"
-                )
-            except Exception as exc:  # noqa: BLE001 — progress is best-effort, never fatal
-                logger.warning("Progress notification failed: %s", exc)
-
-    heartbeat = asyncio.create_task(_beat())
+    heartbeat = asyncio.create_task(_heartbeat(session, token, interval, label))
     try:
         return await coro
     finally:
@@ -750,15 +759,15 @@ async def search(
 
     # Parse comma-separated datasets into list
     datasets_list = parse_csv_list(datasets)
+    # NOTE: search() is not registered as an MCP tool (no @mcp.tool), so it is unreachable over
+    # the protocol; progress notifications are wired into recall only. Wire search here too if it
+    # is ever exposed as a tool.
     try:
-        search_results = await _with_progress(
-            search_task(
-                search_query,
-                normalized_search_type,
-                normalized_top_k,
-                datasets_list,
-            ),
-            label="Searching memory",
+        search_results = await search_task(
+            search_query,
+            normalized_search_type,
+            normalized_top_k,
+            datasets_list,
         )
     except Exception as e:
         error_msg = f"Search failed: {str(e)}"
@@ -1220,6 +1229,7 @@ async def recall(
     search_type: str = None,
     datasets: str = None,
     session_id: str = None,
+    system_prompt: str = None,
     top_k: int = 15,
 ) -> list:
     """Search memory with auto-routing and session awareness.
@@ -1243,6 +1253,8 @@ async def recall(
         Comma-separated dataset names to search within.
     session_id : str, optional
         Session ID for session-first search.
+    system_prompt : str, optional
+        Override the synthesis prompt for completion searches.
     top_k : int
         Maximum results to return (default: 10).
     """
@@ -1256,6 +1268,7 @@ async def recall(
                     search_type=search_type,
                     datasets=dataset_list,
                     session_id=session_id,
+                    system_prompt=system_prompt,
                     top_k=normalized_top_k,
                 ),
                 label="Recalling memory",

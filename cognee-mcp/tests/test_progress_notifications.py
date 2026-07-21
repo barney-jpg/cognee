@@ -110,3 +110,35 @@ def test_recall_tool_emits_progress_for_slow_call(monkeypatch):
     result = asyncio.run(server.recall(query="q"))
     assert isinstance(result, list) and result and result[0].type == "text"
     assert len(session.calls) >= 1
+
+
+def test_recall_tool_emits_progress_over_real_session(monkeypatch):
+    # End-to-end through a real in-memory MCP ClientSession: call the registered `recall` tool
+    # with a progress_callback (which sets progressToken) and assert notifications/progress are
+    # delivered over the transport — exercising SDK context/token propagation and serialization,
+    # not just the monkeypatched helper.
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    class _FakeClient:
+        use_api = False
+
+        async def recall(self, **kwargs):
+            await asyncio.sleep(0.05)
+            return []
+
+    monkeypatch.setattr(server, "cognee_client", _FakeClient())
+    monkeypatch.setenv("COGNEE_MCP_PROGRESS_INTERVAL", "0.01")
+
+    progress_events = []
+
+    async def _on_progress(progress, total, message):
+        progress_events.append((progress, message))
+
+    async def _run():
+        async with create_connected_server_and_client_session(server.mcp) as client:
+            return await client.call_tool("recall", {"query": "q"}, progress_callback=_on_progress)
+
+    result = asyncio.run(_run())
+    assert result.isError is False
+    assert len(progress_events) >= 1
+    assert progress_events[0][1] == "Recalling memory…"
