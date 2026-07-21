@@ -1,0 +1,65 @@
+name: ci | lint + recall/mcp tests
+
+# Fork-owned CI, independent of the upstream workflow set. Runs ruff (lint + format) over the
+# repo and the self-contained recall / MCP test suites that need no LLM key or external DBs, so
+# it goes green on this fork without any secrets. Broader upstream suites (per-DB, e2e, LLM
+# provider matrices) are intentionally not reproduced here.
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv (Python 3.12)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create venv and install
+        run: |
+          uv venv --python 3.12
+          # Core package + test tooling only — the [dev] extra pulls docs deps
+          # (mkdocs-minify -> csscompressor) that fail to build. mcp is needed to import the
+          # cognee-mcp server for its tests.
+          VIRTUAL_ENV=.venv uv pip install -e . pytest pytest-asyncio ruff "mcp>=1.12.0,<2.0.0"
+
+      - name: Ruff lint + format check
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+
+      - name: Recall + MCP tests
+        # Existence-guarded so the workflow is green on develop today and automatically covers
+        # the recall/MCP suites once their PRs (#3, #4) merge — without referencing paths that
+        # do not yet exist on the branch under test.
+        run: |
+          set -e
+          PATHS=""
+          for p in \
+            cognee/tests/unit/modules/recall/ \
+            cognee/tests/unit/api/recall/ \
+            cognee/tests/unit/modules/search/test_get_retriever_output_emits.py \
+            cognee/tests/integration/test_recall_ndjson_stream.py \
+            cognee-mcp/tests/; do
+            [ -e "$p" ] && PATHS="$PATHS $p"
+          done
+          if [ -z "$PATHS" ]; then
+            echo "No target test paths present on this branch; skipping."
+            exit 0
+          fi
+          echo "Running: $PATHS"
+          .venv/bin/python -m pytest -q -p no:cacheprovider $PATHS
