@@ -29,13 +29,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Create venv and install
-        run: |
-          uv venv --python 3.12
-          # Core package + test tooling only — the [dev] extra pulls docs deps
-          # (mkdocs-minify -> csscompressor) that fail to build. mcp is needed to import the
-          # cognee-mcp server for its tests.
-          VIRTUAL_ENV=.venv uv pip install -e . pytest pytest-asyncio ruff "mcp>=1.12.0,<2.0.0"
+      - name: Install dependencies
+        # setup-uv already created and activated .venv (VIRTUAL_ENV points at it), so install
+        # straight into it. Core package + test tooling only — the [dev] extra pulls docs deps
+        # (mkdocs-minify -> csscompressor) that fail to build. mcp is needed to import the
+        # cognee-mcp server for its tests.
+        run: uv pip install -e . pytest pytest-asyncio ruff "mcp>=1.12.0,<2.0.0"
 
       - name: Ruff lint + format check
         run: |
