@@ -1,0 +1,139 @@
+# Image-based compose for deploying the prebuilt GHCR dev images (no local build).
+#
+# Prereq: the Docker host must be logged in to GHCR so it can pull the (private) packages:
+#   echo "$GHCR_PAT" | docker login ghcr.io -u pajoma --password-stdin   # PAT: read:packages
+#
+# Usage:
+#   docker compose -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.ghcr.yml up -d                 # cognee + deps
+#   docker compose -f docker-compose.ghcr.yml --profile mcp up -d   # + MCP server
+#
+# Image tag is overridable: COGNEE_TAG=develop-<sha> docker compose -f docker-compose.ghcr.yml up -d
+#
+# Unlike docker-compose.yml this does NOT build and does NOT bind-mount ./cognee, so the
+# container runs the code baked into the image. Ancillary services (postgres/neo4j/redis) use
+# the same public images and profiles as the main compose. There is no prebuilt frontend image,
+# so the UI is not included here.
+
+services:
+  cognee:
+    container_name: cognee
+    image: ghcr.io/pajoma/cognee:${COGNEE_TAG:-develop}
+    pull_policy: always
+    restart: always
+    networks:
+      - cognee-network
+    volumes:
+      - .env:/app/.env
+      # Uncomment to allow ingestion of local files from host:
+      # - /path/to/your/data:/data
+    environment:
+      - DEBUG=false
+      - ENV=local
+      - LOG_LEVEL=INFO
+      # CAUTION: Default '*' allows all origins. Override with specific domains in production.
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - 8000:8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8GB
+
+  cognee-mcp:
+    container_name: cognee-mcp
+    image: ghcr.io/pajoma/cognee-mcp:${COGNEE_TAG:-develop}
+    pull_policy: always
+    profiles:
+      - mcp
+    networks:
+      - cognee-network
+    command: --no-migration
+    volumes:
+      - .env:/app/.env
+    environment:
+      - DEBUG=false
+      - ENV=local
+      - LOG_LEVEL=INFO
+      - TRANSPORT_MODE=sse
+      # Database configuration - should match the main cognee service
+      - DB_PROVIDER=${DB_PROVIDER:-sqlite}
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-cognee_db}
+      - DB_USERNAME=${DB_USERNAME:-cognee}
+      - DB_PASSWORD=${DB_PASSWORD:-cognee}
+      - PYTHONUNBUFFERED=1
+      # Progress notifications heartbeat (seconds; 0 disables).
+      - COGNEE_MCP_PROGRESS_INTERVAL=${COGNEE_MCP_PROGRESS_INTERVAL:-5}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4GB
+
+  neo4j:
+    image: neo4j:5.26
+    container_name: neo4j
+    restart: always
+    profiles:
+      - neo4j
+    ports:
+      - 7474:7474
+      - 7687:7687
+    environment:
+      - NEO4J_AUTH=neo4j/pleaseletmein
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+    networks:
+      - cognee-network
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: postgres
+    restart: always
+    profiles:
+      - postgres
+    environment:
+      POSTGRES_USER: cognee
+      POSTGRES_PASSWORD: cognee
+      POSTGRES_DB: cognee_db
+    ports:
+      - 5432:5432
+    networks:
+      - cognee-network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    profiles:
+      - redis
+    ports:
+      - "6379:6379"
+    networks:
+      - cognee-network
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+networks:
+  cognee-network:
+    name: cognee-network
+
+volumes:
+  postgres_data:
+  redis_data:
