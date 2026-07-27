@@ -76,6 +76,99 @@ logger = get_logger()
 
 cognee_client: Optional[CogneeClient] = None
 
+
+# ---------------------------------------------------------------------------
+# Progress notifications (issue #1)
+# ---------------------------------------------------------------------------
+# Long recall calls carry no data while running, which can trip idle-based reverse-proxy
+# timeouts and lets progress-aware MCP clients reset their per-request timeout (the MCP spec
+# says clients MAY do so on matching progress, while still enforcing a maximum). A background
+# heartbeat emits `notifications/progress` at a configured interval so the stream stays active
+# and clients that render progress get a "still working" signal — without changing the
+# synchronous return contract. A blind tick for now; once the recall API streams real stages
+# (companion NDJSON work), this can relay actual stages instead. Wired into recall only:
+# search() is not registered as an MCP tool, so it is unreachable over the protocol.
+
+DEFAULT_PROGRESS_INTERVAL = 5.0
+
+
+def _progress_interval() -> float:
+    """Heartbeat period in seconds from COGNEE_MCP_PROGRESS_INTERVAL (default 5; <=0 disables)."""
+    raw = os.getenv("COGNEE_MCP_PROGRESS_INTERVAL")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_PROGRESS_INTERVAL
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid COGNEE_MCP_PROGRESS_INTERVAL=%r; falling back to %s",
+            raw,
+            DEFAULT_PROGRESS_INTERVAL,
+        )
+        return DEFAULT_PROGRESS_INTERVAL
+
+
+def _progress_target():
+    """Return (session, progress_token) when the client requested progress, else (None, None).
+
+    Per the MCP spec the server may only send progress when the request carried a
+    ``progressToken`` in ``_meta``; without one, tools run unchanged.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        ctx = request_ctx.get()
+    except (ImportError, LookupError):
+        return None, None
+    meta = getattr(ctx, "meta", None)
+    token = getattr(meta, "progressToken", None) if meta is not None else None
+    if token is None:
+        return None, None
+    return getattr(ctx, "session", None), token
+
+
+async def _heartbeat(session, token, interval: float, label: str) -> None:
+    """Emit a `notifications/progress` every ``interval`` seconds until cancelled.
+
+    Runs against an explicit (session, token) target — the scheduling policy, decoupled from
+    context/config discovery. A send failure is logged and swallowed so progress stays
+    best-effort and never fatal to the caller.
+    """
+    n = 0
+    while True:
+        await asyncio.sleep(interval)
+        n += 1
+        try:
+            await session.send_progress_notification(
+                progress_token=token, progress=n, message=f"{label}…"
+            )
+        except Exception as exc:  # noqa: BLE001 — progress is best-effort, never fatal
+            logger.warning("Progress notification failed: %s", exc)
+
+
+async def _with_progress(coro, *, label: str):
+    """Await ``coro`` while a heartbeat emits progress notifications.
+
+    Resolves the interval (config) and the (session, token) target (request context), then runs
+    ``coro`` unchanged when progress is disabled or no ``progressToken`` is present. The heartbeat
+    is always cancelled once the result arrives.
+    """
+    interval = _progress_interval()
+    session, token = _progress_target()
+    if interval <= 0 or session is None or token is None:
+        return await coro
+
+    heartbeat = asyncio.create_task(_heartbeat(session, token, interval, label))
+    try:
+        return await coro
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+
+
 # Per-dataset error ring buffer (bounded so long-running servers don't accumulate
 # unbounded memory). Each entry is (iso_timestamp, error_message).
 _TASK_ERROR_HISTORY = 50
@@ -666,6 +759,9 @@ async def search(
 
     # Parse comma-separated datasets into list
     datasets_list = parse_csv_list(datasets)
+    # NOTE: search() is not registered as an MCP tool (no @mcp.tool), so it is unreachable over
+    # the protocol; progress notifications are wired into recall only. Wire search here too if it
+    # is ever exposed as a tool.
     try:
         search_results = await search_task(
             search_query,
@@ -1166,13 +1262,16 @@ async def recall(
         try:
             normalized_top_k = validate_top_k(top_k)
             dataset_list = parse_csv_list(datasets)
-            results = await cognee_client.recall(
-                query_text=query,
-                search_type=search_type,
-                datasets=dataset_list,
-                session_id=session_id,
-                system_prompt=system_prompt,
-                top_k=normalized_top_k,
+            results = await _with_progress(
+                cognee_client.recall(
+                    query_text=query,
+                    search_type=search_type,
+                    datasets=dataset_list,
+                    session_id=session_id,
+                    system_prompt=system_prompt,
+                    top_k=normalized_top_k,
+                ),
+                label="Recalling memory",
             )
             return [
                 types.TextContent(
