@@ -1,0 +1,23 @@
+# Recall NDJSON Streaming — Progress Ledger
+
+**Branch:** `feature/recall-ndjson-streaming` · **Issue:** pajoma/cognee#2
+**Spec:** `docs/superpowers/specs/2026-07-20-recall-ndjson-streaming-design.md` (v4 APPROVED)
+**Plan:** `docs/superpowers/plans/2026-07-20-recall-ndjson-streaming-plan.md`
+**Base:** `fbaba22af` (design docs only). Plan+ledger rebuilt 2026-07-20 (prior copy lost, never pushed).
+
+**Env:** `.venv` uv CPython 3.12.13; core `-e .` + `pytest pytest-asyncio ruff` (docs extra skipped). Tests: `.venv/bin/python -m pytest`.
+
+| # | Task | Status | Commit |
+|---|------|--------|--------|
+| 1 | ProgressEmitter module + unit tests | done | 2cc2455f2 |
+| 2 | Streaming orchestrator stream.py | done | 81c402dcd |
+| 3 | Terminal error mapper + status_code | done | 81c402dcd |
+| 4 | Content negotiation router | done | ca83f6896 |
+| 5 | Emit points recall.py | done | ea7755479 |
+| 6 | Emit points get_retriever_output.py | done | ea7755479 |
+| 7 | Config keepalive interval | done | f95ef0df3 |
+| 8 | MCP client NDJSON consumption | done | 4565425f7 |
+| 9 | Integration test e2e | done | 6484fe7fa |
+
+## Log
+- 2026-07-20: rebuilt plan + ledger from committed spec on Linux box (uv 3.12 venv). Starting Task 1.
