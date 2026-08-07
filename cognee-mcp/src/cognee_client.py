@@ -704,13 +704,24 @@ class CogneeClient:
         session_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
         top_k: int = 15,
+        only_context: bool = False,
     ) -> Any:
-        """Search memory via recall() with auto-routing and session awareness."""
+        """Search memory via recall() with auto-routing and session awareness.
+
+        ``only_context=True`` returns the assembled context without synthesizing an
+        answer, so a caller that is itself an LLM can reason over the raw material
+        instead of paying for a second synthesis it will not use.
+        """
         if not system_prompt:
             system_prompt = _default_recall_system_prompt()
         if self.use_api:
             endpoint = f"{self.api_url}/api/v1/recall"
-            payload = {"query": query_text, "top_k": top_k, "search_type": None}
+            payload = {
+                "query": query_text,
+                "top_k": top_k,
+                "search_type": None,
+                "only_context": only_context,
+            }
             if search_type:
                 payload["search_type"] = search_type.upper()
             if not datasets and not session_id:
@@ -776,7 +787,7 @@ class CogneeClient:
                 return result_data
         else:
             with redirect_stdout(sys.stderr):
-                kwargs = {"top_k": top_k, "auto_route": True}
+                kwargs = {"top_k": top_k, "auto_route": True, "only_context": only_context}
                 if search_type:
                     from cognee.modules.search.types import SearchType
 

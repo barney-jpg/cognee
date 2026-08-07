@@ -776,6 +776,9 @@ async def test_mcp_recall_forwards_system_prompt(monkeypatch):
         "session_id": "session-1",
         "system_prompt": "Answer with provenance.",
         "top_k": 5,
+        # Forwarded unconditionally, so the default appears here even when the caller
+        # omits it; test_recall_only_context.py covers the parameter's own behaviour.
+        "only_context": False,
     }
 
 
