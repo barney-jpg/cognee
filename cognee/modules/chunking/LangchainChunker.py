@@ -3,6 +3,7 @@ from os.path import basename
 from uuid import NAMESPACE_OID, uuid5
 
 from cognee.modules.chunking.Chunker import Chunker
+from cognee.modules.chunking.page_markers import PageTracker
 from .models.DocumentChunk import DocumentChunk
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from cognee.infrastructure.databases.vector import get_vector_engine_async
@@ -40,9 +41,13 @@ class LangchainChunker(Chunker):
         # Resolve the embedding engine once — it's the same for every chunk, so
         # resolving it per chunk inside the loops just adds await/lookup overhead.
         embedding_engine = (await get_vector_engine_async()).embedding_engine
+        # One tracker per document: it carries the current page across chunks that
+        # contain no marker of their own.
+        page_tracker = PageTracker()
         async for content_text in self.get_text():
             for chunk in self.splitter.split_text(content_text):
                 token_count = embedding_engine.tokenizer.count_tokens(chunk)
+                page_start, page_end = page_tracker.stamp(chunk)
                 if token_count <= self.max_chunk_tokens:
                     yield DocumentChunk(
                         id=uuid5(NAMESPACE_OID, chunk),
@@ -55,6 +60,8 @@ class LangchainChunker(Chunker):
                         contains=[],
                         document_id=document_id,
                         document_name=document_name,
+                        page_start=page_start,
+                        page_end=page_end,
                         metadata={
                             "index_fields": ["text"],
                         },

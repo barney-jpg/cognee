@@ -59,6 +59,8 @@ class IndexSchema(DataPoint):
     chunk_index: Optional[int] = None
     source_chunk_id: Optional[str] = None
     importance_weight: Optional[float] = 0.5
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
 
     metadata: dict = {"index_fields": ["text"]}
     belongs_to_set: List[str] = []
@@ -402,6 +404,8 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                     chunk_index=getattr(data_point, "chunk_index", None),
                     source_chunk_id=getattr(data_point, "source_chunk_id", None),
                     importance_weight=getattr(data_point, "importance_weight", None),
+                    page_start=getattr(data_point, "page_start", None),
+                    page_end=getattr(data_point, "page_end", None),
                     belongs_to_set=(data_point.belongs_to_set or []),
                 )
                 for data_point in data_points

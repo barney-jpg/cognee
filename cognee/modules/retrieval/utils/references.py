@@ -19,7 +19,7 @@ when there is nothing usable, and never raise on backend failures.
 """
 
 import re
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, List, NamedTuple, Optional, Set
 
 from cognee.shared.logging_utils import get_logger
 
@@ -133,6 +133,41 @@ def _get_payload(obj: Any) -> Optional[dict]:
     return None
 
 
+class _Candidate(NamedTuple):
+    """One chunk eligible to become an Evidence bullet.
+
+    Named rather than a positional tuple: the bullet is assembled from six
+    different fields, and a positional unpack at that width is where a future
+    field lands in the wrong slot without anything failing.
+    """
+
+    score: int
+    document_name: str
+    number: int
+    text: str
+    data_id: Optional[str]
+    chunk_id: Optional[str]
+    page_suffix: str
+
+
+def _page_suffix(payload: dict) -> str:
+    """Render ', page N' or ', page N-M', or '' when no page is derivable.
+
+    Reads the page_start/page_end stamped during chunking (see
+    chunking/page_markers.py). Both are absent for sources with no pagination,
+    such as pasted text or a CSV row — in that case the citation simply carries
+    no page rather than an invented one.
+    """
+    start = payload.get("page_start")
+    end = payload.get("page_end")
+    # bool is an int subclass; a True here would render as "page 1".
+    if not isinstance(start, int) or isinstance(start, bool):
+        return ""
+    if not isinstance(end, int) or isinstance(end, bool):
+        end = start
+    return f", page {start}" if start == end else f", page {start}-{end}"
+
+
 def _provenance_suffix(data_id: Optional[str], chunk_id: Optional[str]) -> str:
     """Render a '(data_id: …, chunk_id: …)' annotation for whichever ids exist.
 
@@ -216,8 +251,7 @@ def format_chunk_references(
             # rather than presenting unverifiable retrieval order as provenance.
             return ""
 
-    # (overlap_score, document_name, number, text, data_id, chunk_id) per candidate.
-    candidates: List[Tuple[int, str, int, str, Optional[str], Optional[str]]] = []
+    candidates: List[_Candidate] = []
     seen: set = set()
 
     for obj in iterator:
@@ -230,7 +264,8 @@ def format_chunk_references(
         text = _clean_str(payload.get("text"))
 
         # Document name and a chunk number are both required to ground the
-        # citation; text is required for a meaningful snippet.
+        # citation; text is required for a meaningful snippet. The page is
+        # purely additive and never required — see _page_suffix.
         if document_name is None or number is None or text is None:
             continue
 
@@ -254,20 +289,32 @@ def format_chunk_references(
                 # certainly not a source of the answer.
                 continue
 
-        candidates.append((score, document_name, number, text, data_id, chunk_id))
+        candidates.append(
+            _Candidate(
+                score=score,
+                document_name=document_name,
+                number=number,
+                text=text,
+                data_id=data_id,
+                chunk_id=chunk_id,
+                page_suffix=_page_suffix(payload),
+            )
+        )
 
     if not candidates:
         return ""
 
     if answer_terms is not None:
         # Stable sort: highest answer overlap first, retrieval order as tiebreak.
-        candidates.sort(key=lambda candidate: -candidate[0])
+        candidates.sort(key=lambda candidate: -candidate.score)
 
     max_bullets = _clamp_limit(limit)
     bullets = [
-        f"- chunk {number} of document {document_name}"
-        f'{_provenance_suffix(data_id, chunk_id)}: "{_snippet(text)}"'
-        for _, document_name, number, text, data_id, chunk_id in candidates[:max_bullets]
+        f"- chunk {candidate.number} of document {candidate.document_name}"
+        f"{candidate.page_suffix}"
+        f"{_provenance_suffix(candidate.data_id, candidate.chunk_id)}: "
+        f'"{_snippet(candidate.text)}"'
+        for candidate in candidates[:max_bullets]
     ]
 
     return EVIDENCE_HEADER + "\n" + "\n".join(bullets)

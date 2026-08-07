@@ -25,6 +25,10 @@ class DocumentChunk(DataPoint):
     - contains: A list of entities or events contained within the chunk (default is None).
     - document_id: Flat string id of the source document, for reference rendering.
     - document_name: Display name (basename) of the source document, for reference rendering.
+    - page_start: 1-based page (or slide) the chunk starts on, when the source format allows
+    it to be derived. None otherwise.
+    - page_end: 1-based page the chunk ends on. Equal to page_start unless the chunk spans a
+    page break.
     - metadata: A dictionary to hold meta information related to the chunk, including index
     fields.
     """
@@ -42,4 +46,8 @@ class DocumentChunk(DataPoint):
     # and not part of id/dedup.
     truth_alignment: Optional[list[float]] = None
     truth_epoch: Optional[int] = None
+    # Optional page provenance; never embedded (kept out of index_fields). Both stay None
+    # when the source has no derivable pagination — see chunking/page_markers.py.
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
     metadata: dict = {"index_fields": ["text"]}

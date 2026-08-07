@@ -260,3 +260,50 @@ async def test_answer_grounded_references_empty_for_blank_answer_or_engine():
     assert await build_answer_grounded_chunk_references("", AsyncMock()) == ""
     assert await build_answer_grounded_chunk_references("   ", AsyncMock()) == ""
     assert await build_answer_grounded_chunk_references("Revenue grew.", None) == ""
+
+
+# ---------------------------------------------------------------------------
+# page provenance
+# ---------------------------------------------------------------------------
+
+
+def test_page_is_rendered_when_the_chunk_carries_one():
+    result = format_chunk_references([_payload(page_start=7, page_end=7)])
+
+    assert "- chunk 5 of document annual_report.pdf, page 7:" in result
+
+
+def test_a_chunk_spanning_a_break_renders_a_range():
+    result = format_chunk_references([_payload(page_start=7, page_end=8)])
+
+    assert "- chunk 5 of document annual_report.pdf, page 7-8:" in result
+
+
+def test_a_missing_page_end_falls_back_to_the_start():
+    """Old rows indexed before page_end existed must still render a page."""
+    result = format_chunk_references([_payload(page_start=7)])
+
+    assert "annual_report.pdf, page 7:" in result
+
+
+def test_no_page_is_rendered_for_an_unpaged_chunk():
+    """A source with no pagination cites without a page, not with a made-up one."""
+    result = format_chunk_references([_payload()])
+
+    assert "- chunk 5 of document annual_report.pdf:" in result
+    assert "page" not in result
+
+
+def test_a_boolean_page_is_not_rendered_as_page_one():
+    """bool is a subclass of int; True must not become 'page 1'."""
+    result = format_chunk_references([_payload(page_start=True, page_end=True)])
+
+    assert "page" not in result
+
+
+def test_page_is_rendered_before_the_provenance_suffix():
+    """Order matters: '..., page 7 (data_id: ...)', so the page reads as part of
+    the citation rather than as part of the id annotation."""
+    result = format_chunk_references([_payload(page_start=7, page_end=7, document_id="d1")])
+
+    assert ", page 7 (data_id: d1):" in result
