@@ -63,7 +63,11 @@ services:
       dockerfile: cognee-mcp/Dockerfile
     command: --no-migration
     volumes:
-      - .env:/app/.env:ro
+      # The image mirrors the repo: /app is the cognee project root, the server runs from
+      # /app/cognee-mcp. Settings read ".env" relative to the working directory, so the
+      # env file belongs next to the server; the source mount below still overlays
+      # /app/cognee and, via PYTHONPATH, shadows the copy installed into the venv.
+      - .env:/app/cognee-mcp/.env:ro
       - ./cognee:/app/cognee
       # Same storage volumes as the main service: shared memory between the
       # API and the MCP server is the point of running both (same uid 1000).

@@ -6,8 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    # For local cognee repo usage remove comment below and add absolute path to cognee. Then run `uv sync --reinstall` in the mcp folder on local cognee changes.
-    #"cognee[postgres,docs,neo4j] @ file:/Users/igorilic/Desktop/cognee",
+    # Resolved from the sibling source tree, not PyPI — see [tool.uv.sources] below.
+    # That entry replaces the hand-edited absolute path this line used to carry.
+    # The version range still applies and is what a published wheel declares.
     "cognee[postgres-binary,docs,neo4j]>=1.5.0,<2.0.0",
     # FastMCP 3 ships tag-based visibility and the tool-search transform this
     # server relies on; the FastMCP vendored in the `mcp` SDK is an older fork
@@ -67,6 +68,16 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+# cognee-mcp lives inside the cognee repository, one directory below the project it
+# depends on. Without this, `uv sync` here installs the published release and any local
+# change under cognee/** is silently absent from the environment and from built images.
+#
+# uv sources are a development-time resolution mechanism: they are not written into wheel
+# metadata, so a published cognee-mcp still declares the PyPI dependency above.
+#
+# editable = false so the environment holds a built copy rather than a link to the source
+# tree — the Docker image must not depend on a path that only exists at build time.
+cognee = { path = "..", editable = false }
 
 [tool.uv]
 # onnxruntime is pulled in transitively via cognee[docs] -> unstructured.
