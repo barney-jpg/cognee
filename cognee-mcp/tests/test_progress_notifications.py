@@ -135,7 +135,13 @@ def test_recall_tool_emits_progress_over_real_session(monkeypatch):
         progress_events.append((progress, message))
 
     async def _run():
-        async with create_connected_server_and_client_session(server.mcp) as client:
+        # The in-memory harness drives the low-level protocol server: it calls
+        # create_initialization_options(), which only the low-level object exposes.
+        # `server.mcp` used to be the mcp SDK's FastMCP and could be passed directly;
+        # since the move to the standalone `fastmcp` package it no longer forwards that
+        # API, so reach through to the server it wraps. `_mcp_server` is private because
+        # fastmcp offers no public accessor for it.
+        async with create_connected_server_and_client_session(server.mcp._mcp_server) as client:
             return await client.call_tool("recall", {"query": "q"}, progress_callback=_on_progress)
 
     result = asyncio.run(_run())
