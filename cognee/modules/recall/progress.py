@@ -12,9 +12,9 @@ Design: ``docs/superpowers/specs/2026-07-20-recall-ndjson-streaming-design.md``.
 """
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 # Bounded-queue default. Because producers ``await queue.put(...)``, the bound governs
 # backpressure sensitivity only, never correctness: no event is ever dropped. The streaming
@@ -91,3 +91,40 @@ async def emit(stage: str, status: str, detail: Optional[dict] = None) -> None:
     if emitter is None:
         return
     await emitter.emit(stage, status, detail)
+
+
+# The dataset a stage runs against. Bound once by the search entry point and read by the retrieval
+# internals, for the same reason the emitter is a contextvar: the graph_retrieval / llm_generation
+# boundaries sit inside upstream functions whose signatures this fork should not grow.
+_progress_dataset: ContextVar[Optional[str]] = ContextVar("cognee_progress_dataset", default=None)
+
+
+@contextmanager
+def progress_dataset(name: Optional[str]) -> Iterator[None]:
+    """Bind the dataset name that stage details and error attribution are tagged with."""
+    token = _progress_dataset.set(name)
+    try:
+        yield
+    finally:
+        _progress_dataset.reset(token)
+
+
+def stage_detail(**extra) -> dict:
+    """Build a stage detail dict, tagged with the bound dataset name when there is one."""
+    detail = dict(extra)
+    dataset = _progress_dataset.get()
+    if dataset:
+        detail["dataset"] = dataset
+    return detail
+
+
+def attach_stage(exc: BaseException, stage: str) -> None:
+    """Best-effort stage/dataset attribution on a failing exception for terminal ``error.stage``."""
+    try:
+        if getattr(exc, "stage", None) is None:
+            exc.stage = stage
+        dataset = _progress_dataset.get()
+        if dataset and getattr(exc, "dataset", None) is None:
+            exc.dataset = dataset
+    except Exception:  # some builtins forbid attribute assignment — attribution is optional
+        pass
