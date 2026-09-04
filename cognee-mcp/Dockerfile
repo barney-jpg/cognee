@@ -1,7 +1,8 @@
 # Use a Python image with uv pre-installed
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS uv
 
-# Install the project into `/app`
+# The cognee project root. cognee-mcp installs one directory below it, so the
+# `..` path source in cognee-mcp/pyproject.toml resolves to exactly this tree.
 WORKDIR /app
 
 # Enable bytecode compilation
@@ -23,6 +24,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# The cognee sources cognee-mcp resolves against. Without them the path source
+# has nothing to build from and the sync fails outright — which is the point:
+# the previous setup silently installed the published release instead, so a
+# local change under cognee/** never reached the image.
+COPY README.md LICENSE NOTICE.md pyproject.toml /app/
+COPY ./cognee /app/cognee
+COPY ./cognee_db_workers /app/cognee_db_workers
+COPY ./distributed /app/distributed
+COPY ./kuzu /app/kuzu
+
+# Everything from here installs cognee-mcp itself
+WORKDIR /app/cognee-mcp
+
 # Copy pyproject.toml and lockfile first for better caching
 COPY ./cognee-mcp/pyproject.toml ./cognee-mcp/uv.lock ./cognee-mcp/entrypoint.sh ./
 
@@ -32,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Then, add the rest of the project source code and install it
 # Installing separately from its dependencies allows layer caching
-COPY ./cognee-mcp /app
+COPY ./cognee-mcp /app/cognee-mcp
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
@@ -42,39 +56,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/cognee-mcp
 
 # Create the non-root user up front so the COPY below can set ownership in a
 # single layer. A separate `chown -R /app` rewrites metadata on every file,
 # which forces overlayfs to copy up the entire ~9GB /app tree into a second
 # layer (the venv effectively stored twice). `COPY --chown` avoids that.
-# ``chown cognee /app`` (the directory inode only): WORKDIR created /app as
-# root, and ``COPY --chown`` sets ownership on the copied content, not the
-# pre-existing target dir — without this the JSON-extension pre-install below
-# cannot create ``$HOME/.lbdb`` and has been silently falling back to its
-# build warning (and the runtime install fails the same way as non-root).
+# ``chown cognee /app /app/cognee-mcp`` (the directory inodes only): WORKDIR
+# created both as root, and ``COPY --chown`` sets ownership on the copied
+# content, not the pre-existing target dirs — without this the JSON-extension
+# pre-install below cannot create ``$HOME/.lbdb`` and has been silently falling
+# back to its build warning (and the runtime install fails the same way as
+# non-root).
 RUN groupadd --system --gid 1000 cognee \
     && useradd --system --uid 1000 --gid cognee --no-create-home --shell /usr/sbin/nologin cognee \
     && mkdir -p /cognee-storage/system /cognee-storage/data \
     && chown -R cognee:cognee /cognee-storage \
-    && chown cognee:cognee /app
+    && chown cognee:cognee /app /app/cognee-mcp
 
-# Copy the virtual environment from the uv stage
+# Copy the virtual environment from the uv stage. The whole /app tree comes
+# across, cognee sources included; the venv itself holds a built, non-editable
+# copy, so nothing at runtime depends on those sources still being there.
 COPY --from=uv /usr/local /usr/local
 COPY --from=uv --chown=cognee:cognee /app /app
 
 # Strip Windows carriage returns (fixes "no such file" on Windows Docker)
-RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/cognee-mcp/entrypoint.sh && chmod +x /app/cognee-mcp/entrypoint.sh
 
 # Place executables in the environment at the front of the path
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/cognee-mcp/.venv/bin:$PATH"
 
 # Set environment variables for MCP server
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+# Both entries matter: /app/cognee-mcp for the server package itself, /app so a
+# bind-mounted ./cognee source tree shadows the non-editable copy in the venv
+# (see the cognee-mcp volumes in docker-compose.yml).
+ENV PYTHONPATH=/app/cognee-mcp:/app
 # Give the non-root user a stable, writable HOME so Kuzu/Ladybug caches its
 # downloaded extensions in a consistent location across build and runtime.
-ENV HOME=/app
+ENV HOME=/app/cognee-mcp
 # Default storage OUTSIDE the source tree, matching the main image — both
 # containers share the same named volumes with the same uid (1000).
 ENV SYSTEM_ROOT_DIRECTORY=/cognee-storage/system
@@ -96,7 +116,7 @@ RUN python -c "from cognee_db_workers._kuzu_helpers import install_json_extensio
 
 # Use the application name from pyproject.toml for normal operation
 # For testing, we'll override this with a direct command
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/app/cognee-mcp/entrypoint.sh"]
 
 # Only the HTTP/SSE transports serve an HTTP server; in the default stdio mode
 # there is nothing to probe, so report healthy without hitting the network.
