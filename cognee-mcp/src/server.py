@@ -1391,6 +1391,7 @@ async def recall(
     session_id: str = None,
     system_prompt: str = None,
     top_k: int = 15,
+    only_context: bool = False,
 ) -> list:
     """Search memory with auto-routing and session awareness.
 
@@ -1419,6 +1420,10 @@ async def recall(
         on the server.
     top_k : int
         Maximum results to return (default: 10).
+    only_context : bool
+        Return the assembled context without a synthesized answer (default:
+        False). Useful when you want to reason over the retrieved material
+        yourself rather than receive cognee's own answer.
     """
     with redirect_stdout(sys.stderr):
         try:
@@ -1432,6 +1437,7 @@ async def recall(
                     session_id=session_id,
                     system_prompt=system_prompt,
                     top_k=normalized_top_k,
+                    only_context=only_context,
                 ),
                 label="Recalling memory",
             )
