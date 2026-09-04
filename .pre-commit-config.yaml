@@ -19,3 +19,15 @@ repos:
       # Run the formatter.
       - id: ruff-format
         types_or: [python, pyi]
+  - repo: local
+    hooks:
+      # A uv older than 0.9.17 cannot parse `exclude-newer = "2 days"`; it warns, discards
+      # the whole [tool.uv] table and resolves with no window, producing a lock that looks
+      # fine. uv's own `required-version` cannot catch this — it sits in the same discarded
+      # table — so the check lives outside uv. Only fires for the files a stale uv corrupts.
+      - id: uv-version
+        name: uv is new enough to read the project's resolution settings
+        entry: python tools/check-uv-version.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock|cognee-mcp/pyproject\.toml|cognee-mcp/uv\.lock)$
