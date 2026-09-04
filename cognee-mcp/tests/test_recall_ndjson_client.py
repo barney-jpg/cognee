@@ -52,19 +52,35 @@ class _FakeStreamCM:
         return False
 
 
+# Datasets the fake backend reports. A bare recall (no datasets, no session_id)
+# takes recall()'s fallback path and asks for these before it starts streaming,
+# so the fake has to answer that request or the stream is never reached.
+_VISIBLE_DATASETS = [
+    {"id": "d1", "name": "alpha", "created_at": "2026-01-01"},
+    {"id": "d2", "name": "beta", "created_at": "2026-01-02"},
+]
+
+
 class _FakeClient:
-    def __init__(self, response):
+    def __init__(self, response, datasets=None):
         self._response = response
+        self._datasets = _VISIBLE_DATASETS if datasets is None else datasets
         self.captured = None
+        self.dataset_requests = 0
+
+    async def get(self, url, headers=None):
+        """Serve list_datasets(); recall()'s no-scope fallback calls this first."""
+        self.dataset_requests += 1
+        return _FakeResponse({}, json_body=self._datasets)
 
     def stream(self, method, url, json=None, headers=None):
         self.captured = {"method": method, "url": url, "json": json, "headers": headers}
         return _FakeStreamCM(self._response)
 
 
-def _client_with(response):
+def _client_with(response, datasets=None):
     client = CogneeClient(api_url="http://localhost:8000", api_token="token")
-    fake = _FakeClient(response)
+    fake = _FakeClient(response, datasets=datasets)
     client.client = fake
     return client, fake
 
@@ -178,3 +194,56 @@ def test_content_type_is_case_insensitive_with_charset():
     client, _ = _client_with(resp)
 
     assert asyncio.run(client.recall("q")) == [{"ok": True}]
+
+
+# --- no-scope fallback -------------------------------------------------------
+# recall() widens a bare call to every visible dataset, because an unscoped
+# recall would otherwise hit the empty default dataset and 404. That behaviour
+# is what made this file's fake insufficient in the first place, so it is
+# pinned here rather than left implicit.
+
+
+def _ok_response():
+    return _FakeResponse(
+        {"content-type": NDJSON_MEDIA_TYPE},
+        lines=[json.dumps({"type": "result", "data": [{"ok": True}], "seq": 1})],
+    )
+
+
+def test_bare_recall_widens_to_every_visible_dataset():
+    client, fake = _client_with(_ok_response())
+
+    asyncio.run(client.recall("q"))
+
+    assert fake.dataset_requests == 1
+    assert fake.captured["json"]["datasets"] == ["alpha", "beta"]
+
+
+def test_explicit_datasets_skip_the_lookup():
+    client, fake = _client_with(_ok_response())
+
+    asyncio.run(client.recall("q", datasets=["chosen"]))
+
+    assert fake.dataset_requests == 0
+    assert fake.captured["json"]["datasets"] == ["chosen"]
+
+
+def test_session_scoped_recall_is_left_unscoped():
+    """A session recall must stay unscoped so it can search the session cache."""
+    client, fake = _client_with(_ok_response())
+
+    asyncio.run(client.recall("q", session_id="s1"))
+
+    assert fake.dataset_requests == 0
+    assert "datasets" not in fake.captured["json"]
+    assert fake.captured["json"]["session_id"] == "s1"
+
+
+def test_backend_reporting_no_datasets_leaves_the_call_unscoped():
+    """An empty dataset list must not add an empty `datasets` key to the payload."""
+    client, fake = _client_with(_ok_response(), datasets=[])
+
+    asyncio.run(client.recall("q"))
+
+    assert fake.dataset_requests == 1
+    assert "datasets" not in fake.captured["json"]
