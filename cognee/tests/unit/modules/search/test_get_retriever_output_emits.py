@@ -15,6 +15,9 @@ from cognee.modules.search.types import SearchType
 
 # Import the module object (not the same-named function) so monkeypatch targets its globals.
 gro = importlib.import_module("cognee.modules.search.methods.get_retriever_output")
+# The stage boundaries live here: retrieval, context extraction and completion were extracted
+# out of get_retriever_output into this module, so that is where the emits fire.
+sac = importlib.import_module("cognee.modules.retrieval.session_aware_completion")
 
 
 class _FakeRetriever:
@@ -58,7 +61,7 @@ def patch_retriever(monkeypatch):
 
         monkeypatch.setattr(gro, "get_graph_engine", _fake_graph_engine)
         monkeypatch.setattr(gro, "get_search_type_retriever_instance", _fake_get_instance)
-        monkeypatch.setattr(gro, "update_node_access_timestamps", _noop_access)
+        monkeypatch.setattr(sac, "update_node_access_timestamps", _noop_access)
 
     return _install
 

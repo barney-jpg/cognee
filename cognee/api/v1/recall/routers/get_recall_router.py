@@ -17,7 +17,7 @@ from cognee.api.v1.recall.stream import (
 )
 from cognee.exceptions import CogneeApiError
 from cognee.modules.search.operations import get_history
-from cognee.modules.search.types import SearchResult, SearchType
+from cognee.modules.search.types import ContextFormat, SearchResult, SearchType
 from cognee.modules.users.methods import get_authenticated_user
 from cognee.modules.users.models import User
 from cognee.shared.logging_utils import get_logger
@@ -26,13 +26,12 @@ from cognee.shared.utils import send_telemetry
 
 
 class RecallPayloadDTO(InDTO):
-    # Default preserved as GRAPH_COMPLETION for backward compatibility
-    # with existing HTTP clients. Pass ``search_type: null`` explicitly
+    # Default is HYBRID_COMPLETION. Pass ``search_type: null`` explicitly
     # to opt into auto-routing (the new ``cognee.recall`` default).
     search_type: Optional[SearchType] = Field(
-        default=SearchType.GRAPH_COMPLETION,
+        default=SearchType.HYBRID_COMPLETION,
         description=(
-            "Search strategy, e.g. GRAPH_COMPLETION, RAG_COMPLETION, CHUNKS, SUMMARIES. "
+            "Search strategy, e.g. HYBRID_COMPLETION, GRAPH_COMPLETION, RAG_COMPLETION, CHUNKS. "
             "Pass null to let cognee auto-route the query to the best strategy."
         ),
     )
@@ -52,7 +51,11 @@ class RecallPayloadDTO(InDTO):
             "when both are provided. Leave empty to resolve by name."
         ),
     )
-    query: str = Field(default="What is in the document?")
+    query: str = Field(
+        ...,
+        examples=["What is in the document?"],
+        description="The question to answer. Required; there is no default query.",
+    )
     system_prompt: Optional[str] = Field(
         default="Answer the question using the provided context. Be as brief as possible."
     )
@@ -66,6 +69,16 @@ class RecallPayloadDTO(InDTO):
     )
     top_k: Optional[int] = Field(default=15)
     only_context: bool = Field(default=False)
+    context_format: ContextFormat = Field(
+        default=ContextFormat.CONTEXT,
+        examples=[ContextFormat.CONTEXT.value],
+        description=(
+            "Shape of an only_context result. 'context' returns the bare retrieval"
+            " context; 'prompt' returns the full envelope a completion would have"
+            " received — session guidance, conversation history, and the rendered"
+            " user and system prompts. Ignored unless only_context is true."
+        ),
+    )
     verbose: bool = Field(default=False)
     include_references: bool = Field(
         default=False,
@@ -85,10 +98,12 @@ class RecallPayloadDTO(InDTO):
         examples=[None],
         description=(
             "Which memory sources to include: 'graph', 'session', 'trace', "
-            "'session_context', 'tools', 'all', 'auto', or a list of these. Defaults to "
-            "'auto' (session first when session_id is set, else graph). 'tools' is "
-            "explicit opt-in only — never implied by 'auto' or 'all' — and requires "
-            "TOOL_CALLS_ENABLED on the server."
+            "'session_context', 'tools', 'code', 'all', 'auto', or a list of these. "
+            "Defaults to 'auto' (session first when session_id is set, else graph). "
+            "'tools' and 'code' are explicit opt-in only — never implied by 'auto' or "
+            "'all'. 'tools' requires TOOL_CALLS_ENABLED on the server; 'code' runs a "
+            "deterministic code-graph query (see code_query) and tags results "
+            "_source='code'."
         ),
     )
     tool_connections: Optional[list[str]] = Field(
@@ -104,6 +119,18 @@ class RecallPayloadDTO(InDTO):
         description=(
             "When the 'tools' scope runs: 'always', or 'on_empty' to query the "
             "external database only when every other requested source returned nothing."
+        ),
+    )
+    code_query: Optional[dict] = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "'code' scope only: structured operation and arguments for the "
+            "deterministic code-graph query (same format as /v1/search code_query, "
+            'e.g. {"operation": "impact_analysis", "seeds": ["UserService"]}). '
+            "Omit to run the default 'explore' operation with the query text as seed. "
+            "A seed the code graph cannot resolve contributes no results rather than "
+            "failing the recall."
         ),
     )
     context_profile: str = Field(
@@ -136,13 +163,15 @@ def get_recall_router() -> APIRouter:
         text: str
         user: str
         created_at: datetime
+        # Null when the recall was not scoped to a single dataset.
+        dataset_id: Optional[UUID] = None
 
     @router.get("", response_model=list[RecallHistoryItem])
     async def get_recall_history(user: User = Depends(get_authenticated_user)):
         """Get search/recall history for the authenticated user."""
         send_telemetry(
             "Recall API Endpoint Invoked",
-            user.id,
+            user,
             additional_properties={"endpoint": "GET /v1/recall", "cognee_version": cognee_version},
         )
 
@@ -175,7 +204,7 @@ def get_recall_router() -> APIRouter:
         topK); both camelCase and snake_case are accepted.
 
         - **search_type** (Optional[SearchType]): Type of search to perform
-          (default: GRAPH_COMPLETION). Pass null to enable automatic query routing.
+          (default: HYBRID_COMPLETION). Pass null to enable automatic query routing.
         - **datasets** (Optional[List[str]]): Dataset names to search within
         - **dataset_ids** (Optional[List[UUID]]): Dataset UUIDs to search within;
           take precedence over dataset names when both are provided
@@ -184,17 +213,33 @@ def get_recall_router() -> APIRouter:
         - **node_name** (Optional[List[str]]): Filter to specific node sets
         - **top_k** (Optional[int]): Maximum results (default: 15)
         - **only_context** (bool): Return only the LLM context
+        - **context_format** (str): Shape of an only_context result — "context"
+          (default, the bare retrieval context) or "prompt" (the full envelope a
+          completion would receive: session guidance, conversation history, and the
+          rendered user and system prompts)
         - **verbose** (bool): Verbose output
         - **include_references** (bool): Include source/provenance references in
           completion results (default: true)
         - **session_id** (Optional[str]): Session whose cached QA and trace entries
           should be searched
         - **scope** (Optional[str | List[str]]): Memory sources to include: "graph",
-          "session", "trace", "session_context", "all", "auto", or a list of these
-          (default: "auto" — session first when session_id is set, else graph)
+          "session", "trace", "session_context", "tools", "code", "all", "auto", or a
+          list of these (default: "auto" — session first when session_id is set, else
+          graph). "code" is explicit opt-in only and returns deterministic code-graph
+          facts tagged _source="code" (e.g. scope=["graph", "code"])
+        - **code_query** (Optional[dict]): "code" scope only — operation and arguments
+          for the code-graph query (same format as /v1/search code_query); omit for
+          the default "explore" with the query text as seed
         - **response_schema** (Optional[dict]): JSON Schema for structured
           completion output; validated results land in each result's
           ``structured`` field. 422 on schemas outside the supported subset.
+        - **contextProfile** (str): Profile to render for the 'session_context' scope: 'qa'
+          (conversational) or 'agent' (tool/workflow). Ignored by other scopes. Defaults to 'qa'.
+        - **toolConnections** (Optional[List[str]]): Names of authorized external database
+          connections for the 'tools' scope. Omit to use every connection visible to the caller.
+        - **toolsTrigger** (str): When the 'tools' scope runs: 'always', or 'on_empty' to query the
+          external database only when every other requested source returned nothing. Defaults to
+          'always'.
 
         ## Error Codes
         - **402/403/404/409/422**: Cognee errors (payment required, permission
@@ -204,7 +249,7 @@ def get_recall_router() -> APIRouter:
         """
         send_telemetry(
             "Recall API Endpoint Invoked",
-            user.id,
+            user,
             additional_properties={
                 "endpoint": "POST /v1/recall",
                 "search_type": str(payload.search_type),
@@ -231,6 +276,7 @@ def get_recall_router() -> APIRouter:
             top_k=payload.top_k,
             verbose=payload.verbose,
             only_context=payload.only_context,
+            context_format=payload.context_format,
             session_id=payload.session_id,
             scope=payload.scope,
             context_profile=payload.context_profile,
@@ -238,6 +284,7 @@ def get_recall_router() -> APIRouter:
             response_model=response_model,
             tool_connections=payload.tool_connections,
             tools_trigger=payload.tools_trigger,
+            code_query=payload.code_query,
         )
 
         # Content negotiation: stream NDJSON only when the client explicitly opts in via Accept.
@@ -265,8 +312,21 @@ def get_recall_router() -> APIRouter:
             raise
         except ValueError as error:
             # normalize_scope rejects unknown scope names with ValueError;
-            # surface it as a 422 with the valid values instead of an opaque 409.
-            return JSONResponse(status_code=422, content={"error": str(error)})
+            # surface it as a 422 with the valid values instead of an opaque
+            # 409. The message is rebuilt here rather than echoed from the
+            # exception: any ValueError raised deeper in the recall path lands
+            # in this handler too, and its text must not reach the client.
+            from cognee.memory.entries import _VALID_SCOPES
+
+            logger = get_logger()
+            logger.warning("Recall request validation failed: %s", error)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Invalid recall request. If a scope was given, valid values are: "
+                    f"{sorted(_VALID_SCOPES)}."
+                },
+            )
         except Exception as error:
             logger = get_logger()
             logger.error("Recall endpoint error: %s", error, exc_info=True)

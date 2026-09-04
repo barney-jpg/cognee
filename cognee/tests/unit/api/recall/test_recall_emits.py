@@ -17,6 +17,7 @@ from cognee.modules.search.types import SearchType
 recall_mod = importlib.import_module("cognee.api.v1.recall.recall")
 serve_state_mod = importlib.import_module("cognee.api.v1.serve.state")
 search_mod = importlib.import_module("cognee.modules.search.methods.search")
+search_ops_mod = importlib.import_module("cognee.modules.search.operations")
 utils_mod = importlib.import_module("cognee.shared.utils")
 
 MOCK_USER = SimpleNamespace(id=uuid4(), email="t@example.com", is_active=True, tenant_id=uuid4())
@@ -36,6 +37,10 @@ def _mute_side_effects(monkeypatch):
     monkeypatch.setattr(utils_mod, "send_telemetry", lambda *a, **k: None)
     monkeypatch.setattr(serve_state_mod, "get_remote_client", lambda: None)
     monkeypatch.setattr(recall_mod, "set_session_user_context_variable", AsyncMock())
+    # The graph path records the question in search history — a relational write these
+    # emit-point tests have no database for. Patched at its source module because recall()
+    # imports it inside the function.
+    monkeypatch.setattr(search_ops_mod, "log_search_history", AsyncMock())
 
 
 @pytest.mark.asyncio
